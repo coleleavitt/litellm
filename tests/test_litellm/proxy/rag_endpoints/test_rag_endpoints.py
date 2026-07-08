@@ -242,3 +242,45 @@ class TestRagIngestSSRFBlocked:
         assert response.status_code != 400, (
             f"Clean Bedrock ingest_options should not be rejected: {response.json()}"
         )
+
+
+def test_rag_query_returns_response_cost_header(client_internal_user):
+    """
+    /v1/rag/query must surface the completion cost via the
+    x-litellm-response-cost response header, like /v1/chat/completions does.
+    """
+    from litellm.types.utils import ModelResponse
+
+    mock_response = ModelResponse(
+        id="chatcmpl-test",
+        choices=[
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "The codename is AZURE-FALCON-42."},
+                "finish_reason": "stop",
+            }
+        ],
+        model="gpt-4o-mini",
+        usage={"prompt_tokens": 35, "completion_tokens": 14, "total_tokens": 49},
+    )
+    mock_response._hidden_params["response_cost"] = 3.45e-06
+
+    with patch(
+        "litellm.proxy.rag_endpoints.endpoints.litellm.aquery",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ):
+        response = client_internal_user.post(
+            "/v1/rag/query",
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "What is the codename?"}],
+                "retrieval_config": {
+                    "vector_store_id": "vs_test_123",
+                    "custom_llm_provider": "openai",
+                },
+            },
+        )
+
+    assert response.status_code == 200, response.json()
+    assert response.headers.get("x-litellm-response-cost") == "3.45e-06"

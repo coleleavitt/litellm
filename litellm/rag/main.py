@@ -27,6 +27,7 @@ from typing import (
 import httpx
 
 import litellm
+from litellm._internal_context import is_internal_call
 from litellm.rag.ingestion.base_ingestion import BaseRAGIngestion
 from litellm.rag.ingestion.bedrock_ingestion import BedrockRAGIngestion
 from litellm.rag.ingestion.gemini_ingestion import GeminiRAGIngestion
@@ -209,13 +210,18 @@ async def _execute_query_pipeline(
         raise ValueError("No query found in messages for RAG query")
 
     # 2. Search vector store
-    search_response = await litellm.vector_stores.asearch(
-        vector_store_id=retrieval_config["vector_store_id"],
-        query=query_text,
-        max_num_results=retrieval_config.get("top_k", 10),
-        custom_llm_provider=retrieval_config.get("custom_llm_provider", "openai"),
-        **kwargs,
-    )
+    _prev_internal = is_internal_call.get()
+    is_internal_call.set(True)
+    try:
+        search_response = await litellm.vector_stores.asearch(
+            vector_store_id=retrieval_config["vector_store_id"],
+            query=query_text,
+            max_num_results=retrieval_config.get("top_k", 10),
+            custom_llm_provider=retrieval_config.get("custom_llm_provider", "openai"),
+            **kwargs,
+        )
+    finally:
+        is_internal_call.set(_prev_internal)
 
     rerank_response = None
     context_chunks = search_response.get("data", [])
@@ -237,20 +243,24 @@ async def _execute_query_pipeline(
     modified_messages = messages[:-1] + [context_message] + [messages[-1]]
 
     # Use router if available to properly resolve virtual model names
-    if router is not None:
-        response = await router.acompletion(
-            model=model,
-            messages=modified_messages,
-            stream=stream,
-            **kwargs,
-        )
-    else:
-        response = await litellm.acompletion(
-            model=model,
-            messages=modified_messages,
-            stream=stream,
-            **kwargs,
-        )
+    is_internal_call.set(True)
+    try:
+        if router is not None:
+            response = await router.acompletion(
+                model=model,
+                messages=modified_messages,
+                stream=stream,
+                **kwargs,
+            )
+        else:
+            response = await litellm.acompletion(
+                model=model,
+                messages=modified_messages,
+                stream=stream,
+                **kwargs,
+            )
+    finally:
+        is_internal_call.set(_prev_internal)
 
     # 5. Attach search results to response
     if not stream and isinstance(response, ModelResponse):
