@@ -28,6 +28,7 @@ import httpx
 
 import litellm
 from litellm._internal_context import is_internal_call
+from litellm.cost_calculator import vector_store_search_cost
 from litellm.rag.ingestion.base_ingestion import BaseRAGIngestion
 from litellm.rag.ingestion.bedrock_ingestion import BedrockRAGIngestion
 from litellm.rag.ingestion.gemini_ingestion import GeminiRAGIngestion
@@ -223,6 +224,18 @@ async def _execute_query_pipeline(
     finally:
         is_internal_call.set(_prev_internal)
 
+    search_provider = retrieval_config.get("custom_llm_provider", "openai")
+    try:
+        search_cost = sum(
+            vector_store_search_cost(
+                model=search_provider if "/" in search_provider else None,
+                custom_llm_provider=search_provider,
+                response=search_response,
+            )
+        )
+    except Exception:  # noqa: BLE001 - cost accounting must never break the query path
+        search_cost = 0.0
+
     rerank_response = None
     context_chunks = search_response.get("data", [])
 
@@ -269,6 +282,12 @@ async def _execute_query_pipeline(
             search_results=search_response,
             rerank_results=rerank_response,
         )
+        if search_cost > 0:
+            hidden_params = getattr(response, "_hidden_params", None)
+            if isinstance(hidden_params, dict):
+                completion_response_cost = hidden_params.get("response_cost")
+                if completion_response_cost is not None:
+                    hidden_params["response_cost"] = completion_response_cost + search_cost
 
     return response  # type: ignore[return-value]
 

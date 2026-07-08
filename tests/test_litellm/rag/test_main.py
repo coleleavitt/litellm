@@ -11,6 +11,7 @@ aquery carries the completion response with real usage and cost.
 """
 
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -105,6 +106,44 @@ async def test_aquery_response_hidden_params_carry_completion_cost():
     response_cost = response._hidden_params.get("response_cost")
     assert response_cost is not None
     assert response_cost > 0
+
+
+@pytest.mark.asyncio
+async def test_aquery_billed_cost_includes_priced_vector_store_search():
+    """
+    When the vector store provider prices search calls (e.g. per-query cost),
+    that cost must be folded into the aquery billing instead of being dropped
+    with the suppressed sub-call event.
+    """
+    recording_logger = RecordingLogger()
+    original_callbacks = litellm.callbacks
+    litellm.callbacks = [recording_logger]
+
+    try:
+        with patch("litellm.rag.main.vector_store_search_cost", return_value=(0.002, 0.0)):
+            response = await litellm.aquery(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+                retrieval_config={"vector_store_id": "vs_test_123", "custom_llm_provider": "openai"},
+                mock_response="hi there",
+            )
+
+        for _ in range(50):
+            if recording_logger.success_events:
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
+    finally:
+        litellm.callbacks = original_callbacks
+
+    assert isinstance(response, ModelResponse)
+    total_cost = response._hidden_params.get("response_cost")
+    assert total_cost is not None
+    assert total_cost > 0.002
+
+    assert len(recording_logger.success_events) == 1
+    standard_logging_object = recording_logger.success_events[0]["kwargs"]["standard_logging_object"]
+    assert standard_logging_object["response_cost"] == total_cost
 
 
 def test_rag_call_types_are_registered():
