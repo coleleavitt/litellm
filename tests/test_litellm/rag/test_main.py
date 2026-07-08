@@ -37,23 +37,27 @@ async def test_aquery_single_billing_event_carries_completion_usage_and_cost():
     not the vector store search response.
     """
     recording_logger = RecordingLogger()
+    original_callbacks = litellm.callbacks
     litellm.callbacks = [recording_logger]
 
-    response = await litellm.aquery(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": "What is the secret project codename?"}],
-        retrieval_config={"vector_store_id": "vs_test_123", "custom_llm_provider": "openai"},
-        mock_response="The secret project codename is AZURE-FALCON-42.",
-    )
+    try:
+        response = await litellm.aquery(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "What is the secret project codename?"}],
+            retrieval_config={"vector_store_id": "vs_test_123", "custom_llm_provider": "openai"},
+            mock_response="The secret project codename is AZURE-FALCON-42.",
+        )
 
-    assert isinstance(response, ModelResponse)
-    assert is_internal_call.get() is False
+        assert isinstance(response, ModelResponse)
+        assert is_internal_call.get() is False
 
-    for _ in range(50):
-        if recording_logger.success_events:
-            break
-        await asyncio.sleep(0.1)
-    await asyncio.sleep(0.5)
+        for _ in range(50):
+            if recording_logger.success_events:
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
+    finally:
+        litellm.callbacks = original_callbacks
 
     assert len(recording_logger.success_events) == 1
     event = recording_logger.success_events[0]
