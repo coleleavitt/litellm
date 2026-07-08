@@ -269,6 +269,8 @@ def test_rag_query_returns_response_cost_header(client_internal_user):
         "litellm.proxy.rag_endpoints.endpoints.litellm.aquery",
         new_callable=AsyncMock,
         return_value=mock_response,
+    ), patch("litellm.vector_store_registry", None), patch(
+        "litellm.proxy.proxy_server.prisma_client", None
     ):
         response = client_internal_user.post(
             "/v1/rag/query",
