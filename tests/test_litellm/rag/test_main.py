@@ -30,15 +30,28 @@ class RecordingLogger(CustomLogger):
 
 
 @pytest.mark.asyncio
-async def test_aquery_single_billing_event_carries_completion_usage_and_cost():
+@pytest.mark.parametrize("use_router", [False, True])
+async def test_aquery_single_billing_event_carries_completion_usage_and_cost(use_router):
     """
     litellm.aquery must produce exactly one success event, and that event must
     carry the LLM completion (a ModelResponse with non-zero usage and cost),
-    not the vector store search response.
+    not the vector store search response. The proxy always passes a router, so
+    both the router and non-router completion branches are pinned.
     """
     recording_logger = RecordingLogger()
     original_callbacks = litellm.callbacks
     litellm.callbacks = [recording_logger]
+
+    router_kwargs = {}
+    if use_router:
+        router_kwargs["router"] = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "gpt-4o-mini",
+                    "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "test-key"},
+                }
+            ]
+        )
 
     try:
         response = await litellm.aquery(
@@ -46,6 +59,7 @@ async def test_aquery_single_billing_event_carries_completion_usage_and_cost():
             messages=[{"role": "user", "content": "What is the secret project codename?"}],
             retrieval_config={"vector_store_id": "vs_test_123", "custom_llm_provider": "openai"},
             mock_response="The secret project codename is AZURE-FALCON-42.",
+            **router_kwargs,
         )
 
         assert isinstance(response, ModelResponse)
