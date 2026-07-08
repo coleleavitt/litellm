@@ -237,18 +237,27 @@ async def _execute_query_pipeline(
         search_cost = 0.0
 
     rerank_response = None
+    rerank_cost = 0.0
     context_chunks = search_response.get("data", [])
 
     # 3. Optional rerank
     if rerank and rerank.get("enabled"):
         documents = RAGQuery.extract_documents_from_search(search_response)
         if documents:
-            rerank_response = await litellm.arerank(
-                model=rerank["model"],
-                query=query_text,
-                documents=documents,
-                top_n=rerank.get("top_n", 5),
-            )
+            is_internal_call.set(True)
+            try:
+                rerank_response = await litellm.arerank(
+                    model=rerank["model"],
+                    query=query_text,
+                    documents=documents,
+                    top_n=rerank.get("top_n", 5),
+                )
+            finally:
+                is_internal_call.set(_prev_internal)
+            rerank_hidden_params = getattr(rerank_response, "_hidden_params", None)
+            if isinstance(rerank_hidden_params, dict):
+                rerank_response_cost: Optional[float] = rerank_hidden_params.get("response_cost")
+                rerank_cost = rerank_response_cost or 0.0
             context_chunks = RAGQuery.get_top_chunks_from_rerank(search_response, rerank_response)
 
     # 4. Build context message and call completion
@@ -282,12 +291,13 @@ async def _execute_query_pipeline(
             search_results=search_response,
             rerank_results=rerank_response,
         )
-        if search_cost > 0:
+        sub_call_cost = search_cost + rerank_cost
+        if sub_call_cost > 0:
             hidden_params = getattr(response, "_hidden_params", None)
             if isinstance(hidden_params, dict):
-                completion_response_cost = hidden_params.get("response_cost")
+                completion_response_cost: Optional[float] = hidden_params.get("response_cost")
                 if completion_response_cost is not None:
-                    hidden_params["response_cost"] = completion_response_cost + search_cost
+                    hidden_params["response_cost"] = completion_response_cost + sub_call_cost
 
     return response  # type: ignore[return-value]
 
