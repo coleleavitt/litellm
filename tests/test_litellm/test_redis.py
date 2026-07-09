@@ -629,3 +629,42 @@ def test_sync_client_url_used_when_no_cluster(mock_from_url, monkeypatch):
     get_redis_client()
 
     mock_from_url.assert_called_once()
+
+
+def test_connection_pool_ssl_false_uses_plain_connection(monkeypatch):
+    """ssl=False must not select SSLConnection; the value decides, not key presence."""
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_CLUSTER_NODES", raising=False)
+    monkeypatch.delenv("REDIS_SSL", raising=False)
+
+    pool = get_redis_connection_pool(host="plain-host", port=6379, ssl=False)
+
+    assert pool is not None
+    assert pool.connection_class is async_redis.Connection
+    assert "ssl" not in pool.connection_kwargs
+
+
+def test_connection_pool_ssl_true_uses_ssl_connection(monkeypatch):
+    """ssl=True selects SSLConnection and the ssl key is not forwarded to the pool."""
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_CLUSTER_NODES", raising=False)
+    monkeypatch.delenv("REDIS_SSL", raising=False)
+
+    pool = get_redis_connection_pool(host="tls-host", port=6379, ssl=True)
+
+    assert pool is not None
+    assert pool.connection_class is async_redis.SSLConnection
+    assert "ssl" not in pool.connection_kwargs
+
+
+def test_connection_pool_env_redis_ssl_false_uses_plain_connection(monkeypatch):
+    """REDIS_SSL=false from the environment must not select SSLConnection."""
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_CLUSTER_NODES", raising=False)
+    monkeypatch.setenv("REDIS_SSL", "false")
+
+    pool = get_redis_connection_pool(host="plain-host", port=6379)
+
+    assert pool is not None
+    assert pool.connection_class is async_redis.Connection
+    assert "ssl" not in pool.connection_kwargs
