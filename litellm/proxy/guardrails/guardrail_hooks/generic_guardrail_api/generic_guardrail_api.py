@@ -357,7 +357,10 @@ class GenericGuardrailAPI(CustomGuardrail):
     ) -> GenericGuardrailAPIInputs:
         # Action is NONE or no modifications needed
         return_inputs = GenericGuardrailAPIInputs(texts=texts)
-        if guardrail_response.texts:
+        # ``is not None`` preserves an explicit empty list (a guardrail suppressing
+        # the entire response). Treating ``[]`` as falsy would restore the input
+        # texts and silently leak content the guardrail intended to remove.
+        if guardrail_response.texts is not None:
             return_inputs["texts"] = guardrail_response.texts
         if guardrail_response.images:
             return_inputs["images"] = guardrail_response.images

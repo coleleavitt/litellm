@@ -1211,6 +1211,96 @@ class TestStreamingTransform:
         assert "SECRET" in all_text
 
     @pytest.mark.asyncio
+    async def test_mixed_chunk_finish_reason_arrives_after_transformed_text(self):
+        """When a single chunk carries both delta.content and tool_calls with
+        finish_reason set, the passthrough must NOT emit finish_reason before the
+        transformed text: SSE clients that stop reading at finish_reason would
+        silently drop the guardrailed text. The finish_reason must ride on the
+        final synthetic text chunk instead."""
+        guardrail = _StreamingTextGuardrail()
+
+        mixed = ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(
+                        content="secret",
+                        role="assistant",
+                        tool_calls=[
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "f", "arguments": "{}"},
+                            }
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+        )
+
+        out = await _drive_stream(UnifiedLLMGuardrails(), guardrail, [mixed])
+
+        # Locate the passthrough (has tool_calls) and the transformed text chunk
+        # (has content but no tool_calls) for choice 0.
+        passthrough_idx = next(
+            i for i, item in enumerate(out) if item.choices and item.choices[0].delta.tool_calls
+        )
+        text_idxs = [
+            i
+            for i, item in enumerate(out)
+            if item.choices and (item.choices[0].delta.content or "") and not item.choices[0].delta.tool_calls
+        ]
+        assert text_idxs, "transformed text chunk missing"
+        # The passthrough must precede the text chunk (order preserved).
+        assert passthrough_idx < text_idxs[-1]
+        # And finish_reason must live on a chunk at or after the last text chunk,
+        # not before it. The passthrough for a mixed-content chunk MUST NOT carry
+        # finish_reason.
+        assert out[passthrough_idx].choices[0].finish_reason is None
+        # The final text chunk owns the finish_reason.
+        final_finish = out[text_idxs[-1]].choices[0].finish_reason
+        assert final_finish == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_only_chunk_preserves_finish_reason_on_passthrough(self):
+        """Regression guard: for a pure tool-call chunk (no content), the
+        passthrough MUST still carry finish_reason. Only mixed chunks defer it."""
+        guardrail = _StreamingTextGuardrail()
+
+        chunks = [
+            _stream_chunk("hello"),
+            ModelResponseStream(
+                choices=[
+                    StreamingChoices(
+                        index=0,
+                        delta=Delta(
+                            content=None,
+                            role="assistant",
+                            tool_calls=[
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "f", "arguments": "{}"},
+                                }
+                            ],
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+            ),
+        ]
+
+        out = await _drive_stream(UnifiedLLMGuardrails(), guardrail, chunks)
+
+        tool_chunks = [i for i in out if i.choices[0].delta.tool_calls]
+        assert tool_chunks, "tool chunk missing from output"
+        # Pure tool-call chunk: finish_reason rides on the passthrough as before.
+        assert tool_chunks[0].choices[0].finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
     async def test_guardrail_always_sees_raw_accumulated_text(self):
         """The guardrail must receive the raw accumulated output each round, not a
         transformed-prefix + raw-suffix mix (responses_so_far stays untouched)."""

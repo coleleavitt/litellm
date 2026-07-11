@@ -1402,6 +1402,28 @@ class TestGenericGuardrailAPIResponseParsing:
         assert result["texts"] == ["Alice went to Berlin"]
         assert result["stream_holdback_chars"] == [5]
 
+    @pytest.mark.asyncio
+    async def test_empty_texts_response_suppresses_input_texts(self, generic_guardrail):
+        """A GUARDRAIL_INTERVENED response with an explicit empty texts list must
+        suppress the input texts, not restore them. Prior behavior treated ``[]``
+        as falsy and fell back to the raw input, silently leaking content the
+        guardrail intended to remove."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "action": "GUARDRAIL_INTERVENED",
+            "texts": [],
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(generic_guardrail.async_handler, "post", return_value=mock_response):
+            result = await generic_guardrail.apply_guardrail(
+                inputs={"texts": ["sensitive prompt"]},
+                request_data={},
+                input_type="response",
+            )
+
+        assert result["texts"] == []
+
 
 class TestGenericGuardrailAPIStreamingViaUnified:
     """Streaming output checks routed through UnifiedLLMGuardrails."""

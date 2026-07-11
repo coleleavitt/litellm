@@ -564,6 +564,8 @@ class UnifiedLLMGuardrails(CustomLogger):
             )
 
         saw_tool_calls = False
+        saw_text_content = False
+        deferred_finish_reason_for_text = False
 
         try:
             async for item in response:
@@ -575,11 +577,27 @@ class UnifiedLLMGuardrails(CustomLogger):
                 # in responses_so_far so its text is still accumulated + redacted +
                 # emitted as synthetic deltas, and so the guardrail inspects the
                 # assembled tool calls at end of stream (see the block inspection
-                # below), matching block_only. finish_reason rides on the raw
-                # tool-only chunk, so it is not recorded for the text flush.
+                # below), matching block_only. For choices that carry only tool_calls
+                # (no text), finish_reason rides on the passthrough. For choices
+                # that carry BOTH text and tool_calls, _tool_call_passthrough_chunk
+                # defers finish_reason to finish_reason_per_choice so the final
+                # synthetic text chunk delivers it (SSE clients stop reading at
+                # finish_reason, so emitting it on the passthrough would drop the
+                # transformed text).
                 if self._chunk_has_tool_calls(item):
                     saw_tool_calls = True
-                    tool_only = self._tool_call_passthrough_chunk(item)
+                    # A mixed-content chunk counts as text seen too (its content
+                    # rides in responses_so_far and needs to be flushed).
+                    for _choice in getattr(item, "choices", None) or []:
+                        _delta = getattr(_choice, "delta", None)
+                        _content = getattr(_delta, "content", None)
+                        if isinstance(_content, str) and _content != "":
+                            saw_text_content = True
+                            if getattr(_choice, "finish_reason", None) is not None:
+                                deferred_finish_reason_for_text = True
+                    tool_only = self._tool_call_passthrough_chunk(
+                        item, finish_reason_per_choice=finish_reason_per_choice
+                    )
                     responses_yielded.append(tool_only)
                     yield tool_only
                     responses_so_far.append(item)
@@ -590,6 +608,14 @@ class UnifiedLLMGuardrails(CustomLogger):
                 responses_so_far.append(item)
                 last_chunk = item
                 self._record_finish_reasons(item, finish_reason_per_choice)
+                # Any text-carrying chunk (with or without finish_reason) means the
+                # final _round(is_final=True) may have something to emit.
+                for _choice in getattr(item, "choices", None) or []:
+                    _delta = getattr(_choice, "delta", None)
+                    _content = getattr(_delta, "content", None)
+                    if isinstance(_content, str) and _content != "":
+                        saw_text_content = True
+                        break
                 # Skip the sampled round for a terminal chunk: the end-of-stream
                 # flush below processes it once with holdback forced to 0, so a
                 # sampled round here would guardrail the same content twice.
@@ -615,7 +641,13 @@ class UnifiedLLMGuardrails(CustomLogger):
                 ):
                     yield out
 
-            if last_chunk is not None:
+            # Skip the final transform round when the stream carried only
+            # tool_calls (no text ever accumulated) and there is no deferred
+            # finish_reason waiting to be flushed. Without this guard, a
+            # tool-call-only stream that already ran _inspect_full_response_for_block
+            # would trigger a redundant second guardrail HTTP call at end of stream
+            # with nothing new to emit.
+            if last_chunk is not None and (saw_text_content or deferred_finish_reason_for_text or not saw_tool_calls):
                 async for out in _round(last_chunk, is_final=True):
                     yield out
         except _StreamTerminated:
@@ -672,26 +704,46 @@ class UnifiedLLMGuardrails(CustomLogger):
         return False
 
     @staticmethod
-    def _tool_call_passthrough_chunk(item: Any) -> ModelResponseStream:
+    def _tool_call_passthrough_chunk(
+        item: Any,
+        finish_reason_per_choice: Optional[dict[int, Optional[str]]] = None,
+    ) -> ModelResponseStream:
         """Copy of a chunk carrying tool calls with all text content stripped.
 
         Only tool_calls, role and finish_reason are forwarded; content is set to
         None so response text can never be delivered raw (it flows through the
         transform instead). Applies per choice so an n>1 chunk mixing a text
         choice and a tool-call choice does not leak the text choice.
+
+        For a choice that carries BOTH text content AND tool_calls, ``finish_reason``
+        is suppressed on the passthrough and instead recorded on
+        ``finish_reason_per_choice`` (when provided) so the final synthetic text
+        chunk delivers it. Emitting the passthrough's ``finish_reason`` before the
+        text flush would let a spec-compliant SSE client stop reading at
+        ``finish_reason`` and silently drop the guardrailed text, defeating the
+        redaction purpose.
         """
         synthetic_choices: list[StreamingChoices] = []
         for choice in getattr(item, "choices", None) or []:
             delta = getattr(choice, "delta", None)
+            idx = getattr(choice, "index", 0) or 0
+            original_finish = getattr(choice, "finish_reason", None)
+            has_text = isinstance(getattr(delta, "content", None), str) and getattr(delta, "content", "") != ""
+            if has_text and original_finish is not None and finish_reason_per_choice is not None:
+                # Defer this choice's finish_reason to the final text flush.
+                finish_reason_per_choice[idx] = original_finish
+                passthrough_finish: Optional[str] = None
+            else:
+                passthrough_finish = original_finish
             synthetic_choices.append(
                 StreamingChoices(
-                    index=getattr(choice, "index", 0) or 0,
+                    index=idx,
                     delta=Delta(
                         content=None,
                         role=getattr(delta, "role", None),
                         tool_calls=getattr(delta, "tool_calls", None),
                     ),
-                    finish_reason=getattr(choice, "finish_reason", None),
+                    finish_reason=passthrough_finish,
                 )
             )
         return ModelResponseStream(
