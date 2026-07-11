@@ -612,8 +612,13 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             sink.holdback_per_choice = {}
             return
 
-        indices = list(raw_by_index.keys())
-        texts_to_check = list(raw_by_index.values())
+        # Sort by StreamingChoices.index so an n>1 stream that emits choice 1 before
+        # choice 0 still hands the guardrail texts in a deterministic index order.
+        # Without this, the guardrail's returned texts (aligned to the input order it
+        # received) would map back to the wrong choice indices when we rebuild the
+        # sink dicts by ``enumerate(indices)``.
+        indices = sorted(raw_by_index.keys())
+        texts_to_check = [raw_by_index[i] for i in indices]
 
         if request_data is None:
             request_data = {"responses": responses_so_far}

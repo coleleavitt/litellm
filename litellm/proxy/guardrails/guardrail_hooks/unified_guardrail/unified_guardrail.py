@@ -394,6 +394,29 @@ class UnifiedLLMGuardrails(CustomLogger):
         rewrite recent output must withhold it first via ``stream_holdback_chars``.
         """
         if not mutated_text_per_choice:
+            # On the final flush a deferred finish_reason (from a mixed
+            # content+tool_calls chunk whose passthrough suppressed it) still needs
+            # to reach the client, even if the guardrail returned no text to emit.
+            # Build a terminator chunk carrying finish_reason per choice.
+            if is_final and finish_reason_per_choice:
+                terminator_choices: list[StreamingChoices] = []
+                for choice_idx, finish_reason in finish_reason_per_choice.items():
+                    if finish_reason is None:
+                        continue
+                    terminator_choices.append(
+                        StreamingChoices(
+                            index=choice_idx,
+                            delta=Delta(content="", role=None, tool_calls=None),
+                            finish_reason=finish_reason,
+                        )
+                    )
+                if terminator_choices:
+                    return ModelResponseStream(
+                        id=getattr(reference_chunk, "id", None),
+                        created=getattr(reference_chunk, "created", None),
+                        model=getattr(reference_chunk, "model", None),
+                        choices=terminator_choices,
+                    )
             return None
 
         deltas: dict[int, str] = {}
@@ -586,15 +609,11 @@ class UnifiedLLMGuardrails(CustomLogger):
                 # transformed text).
                 if self._chunk_has_tool_calls(item):
                     saw_tool_calls = True
-                    # A mixed-content chunk counts as text seen too (its content
-                    # rides in responses_so_far and needs to be flushed).
-                    for _choice in getattr(item, "choices", None) or []:
-                        _delta = getattr(_choice, "delta", None)
-                        _content = getattr(_delta, "content", None)
-                        if isinstance(_content, str) and _content != "":
-                            saw_text_content = True
-                            if getattr(_choice, "finish_reason", None) is not None:
-                                deferred_finish_reason_for_text = True
+                    has_text, has_text_and_finish = self._inspect_text_on_chunk(item)
+                    if has_text:
+                        saw_text_content = True
+                    if has_text_and_finish:
+                        deferred_finish_reason_for_text = True
                     tool_only = self._tool_call_passthrough_chunk(
                         item, finish_reason_per_choice=finish_reason_per_choice
                     )
@@ -608,14 +627,15 @@ class UnifiedLLMGuardrails(CustomLogger):
                 responses_so_far.append(item)
                 last_chunk = item
                 self._record_finish_reasons(item, finish_reason_per_choice)
-                # Any text-carrying chunk (with or without finish_reason) means the
-                # final _round(is_final=True) may have something to emit.
-                for _choice in getattr(item, "choices", None) or []:
-                    _delta = getattr(_choice, "delta", None)
-                    _content = getattr(_delta, "content", None)
-                    if isinstance(_content, str) and _content != "":
-                        saw_text_content = True
-                        break
+                if self._chunk_carries_text(item):
+                    saw_text_content = True
+                elif self._is_usage_only_chunk(item):
+                    # A stream_options.include_usage terminal chunk carries no text
+                    # and no tool calls; pass it through so clients keep receiving
+                    # usage metadata under incremental_diff (block_only forwards it).
+                    responses_yielded.append(item)
+                    yield item
+                    continue
                 # Skip the sampled round for a terminal chunk: the end-of-stream
                 # flush below processes it once with holdback forced to 0, so a
                 # sampled round here would guardrail the same content twice.
@@ -702,6 +722,58 @@ class UnifiedLLMGuardrails(CustomLogger):
             if getattr(delta, "tool_calls", None):
                 return True
         return False
+
+    @staticmethod
+    def _chunk_carries_text(item: Any) -> bool:
+        """True if any choice in this chunk has non-empty string ``delta.content``."""
+        for choice in getattr(item, "choices", None) or []:
+            delta = getattr(choice, "delta", None)
+            content = getattr(delta, "content", None)
+            if isinstance(content, str) and content != "":
+                return True
+        return False
+
+    @staticmethod
+    def _is_usage_only_chunk(item: Any) -> bool:
+        """True if the chunk has usage but no text and no tool_calls.
+
+        OpenAI ``stream_options.include_usage`` emits a terminal chunk with
+        ``usage`` populated and empty ``choices`` (or choices with empty deltas).
+        The block_only path forwards these; incremental_diff must too.
+        """
+        if not getattr(item, "usage", None):
+            return False
+        for choice in getattr(item, "choices", None) or []:
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            if getattr(delta, "tool_calls", None):
+                return False
+            content = getattr(delta, "content", None)
+            if isinstance(content, str) and content != "":
+                return False
+        return True
+
+    @staticmethod
+    def _inspect_text_on_chunk(item: Any) -> tuple[bool, bool]:
+        """Return ``(has_text, has_text_and_finish)`` for a tool-call-carrying chunk.
+
+        ``has_text`` is True if any choice has non-empty string ``delta.content``.
+        ``has_text_and_finish`` is True if any choice has BOTH non-empty content
+        and a non-null ``finish_reason``: that finish_reason is deferred to the
+        final text flush (see ``_tool_call_passthrough_chunk``), so the caller
+        must run the final ``_round`` even though the passthrough already fired.
+        """
+        has_text = False
+        has_text_and_finish = False
+        for choice in getattr(item, "choices", None) or []:
+            delta = getattr(choice, "delta", None)
+            content = getattr(delta, "content", None)
+            if isinstance(content, str) and content != "":
+                has_text = True
+                if getattr(choice, "finish_reason", None) is not None:
+                    has_text_and_finish = True
+        return has_text, has_text_and_finish
 
     @staticmethod
     def _tool_call_passthrough_chunk(

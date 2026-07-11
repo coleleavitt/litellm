@@ -1301,6 +1301,61 @@ class TestStreamingTransform:
         assert tool_chunks[0].choices[0].finish_reason == "tool_calls"
 
     @pytest.mark.asyncio
+    async def test_final_finish_reason_flushed_when_guardrail_suppresses_text(self):
+        """When the guardrail returns texts=[] (full suppression) and a mixed
+        content+tool_call chunk had deferred its finish_reason to the text flush,
+        the final flush must still emit a terminator chunk carrying finish_reason.
+        Otherwise the SSE stream ends without a finish_reason at all."""
+
+        class _SuppressAll(_StreamingTextGuardrail):
+            async def apply_guardrail(self, inputs, request_data, input_type, **kwargs):
+                self.received_texts.append(list(inputs.get("texts") or []))
+                return {"texts": []}
+
+        mixed = ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(
+                        content="secret",
+                        role="assistant",
+                        tool_calls=[
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "f", "arguments": "{}"},
+                            }
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+        )
+
+        out = await _drive_stream(UnifiedLLMGuardrails(), _SuppressAll(), [mixed])
+
+        finishes = [c.finish_reason for item in out for c in item.choices if c.index == 0]
+        assert "tool_calls" in finishes
+
+    @pytest.mark.asyncio
+    async def test_usage_only_chunk_passes_through(self):
+        """A stream_options.include_usage terminal chunk (usage set, no text, no
+        tool_calls) must be forwarded to the client on the incremental_diff path,
+        matching block_only. Otherwise clients lose usage metadata."""
+        guardrail = _StreamingTextGuardrail()
+
+        text = _stream_chunk("hello ")
+        text2 = _stream_chunk("world", finish_reason="stop")
+        usage = ModelResponseStream(choices=[], usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+
+        out = await _drive_stream(UnifiedLLMGuardrails(), guardrail, [text, text2, usage])
+
+        usage_out = [item for item in out if getattr(item, "usage", None)]
+        assert usage_out, "usage chunk missing from forwarded stream"
+        assert usage_out[0].usage["total_tokens"] == 5
+
+    @pytest.mark.asyncio
     async def test_guardrail_always_sees_raw_accumulated_text(self):
         """The guardrail must receive the raw accumulated output each round, not a
         transformed-prefix + raw-suffix mix (responses_so_far stays untouched)."""
@@ -1329,6 +1384,33 @@ class TestStreamingTransform:
         accumulated = handler._accumulate_string_content_by_choice_index(chunks)
 
         assert accumulated == {1: "hello world"}
+
+    @pytest.mark.asyncio
+    async def test_transform_sends_texts_sorted_by_choice_index(self):
+        """For n>1 streams where choice 1 emits before choice 0, the transform
+        must send texts to the guardrail in ascending choice-index order so its
+        returned texts realign to the correct choice indices on write-back."""
+
+        class _RecordingGuardrail(_StreamingTextGuardrail):
+            async def apply_guardrail(self, inputs, request_data, input_type, **kwargs):
+                self.received_texts.append(list(inputs.get("texts") or []))
+                return {"texts": list(inputs.get("texts") or [])}
+
+        guardrail = _RecordingGuardrail()
+
+        # Choice 1 arrives first with "beta", choice 0 second with "alpha".
+        chunks = [
+            _stream_chunk("beta", index=1),
+            _stream_chunk("alpha", index=0),
+            _stream_chunk("", index=0, finish_reason="stop"),
+        ]
+
+        await _drive_stream(UnifiedLLMGuardrails(), guardrail, chunks)
+
+        # Guardrail must always see the choice-0 text before the choice-1 text.
+        last = guardrail.received_texts[-1]
+        assert last[0].startswith("alpha")
+        assert last[1].startswith("beta")
 
     @pytest.mark.asyncio
     async def test_terminal_chunk_not_guardrailed_twice(self):
