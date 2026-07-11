@@ -729,8 +729,8 @@ async def _mint_bridge_delegate_token_response(
         envelope_keys_from_master_key,
     )
     from litellm.proxy._experimental.mcp_server.outbound_credentials.envelope import (  # noqa: PLC0415  # inline import avoids a module-load circular import
-        EnvelopeIdentity,
         SealedEnvelope,
+        key_hash_identity,
     )
     from litellm.proxy.proxy_server import (
         master_key,  # noqa: PLC0415  # inline import avoids a module-load circular import
@@ -758,7 +758,7 @@ async def _mint_bridge_delegate_token_response(
 
     now = datetime.now(timezone.utc)
     keys = envelope_keys_from_master_key(master_key)
-    identity = EnvelopeIdentity(server_id=mcp_server.server_id, key_hash=key_hash)
+    identity = key_hash_identity(server_id=mcp_server.server_id, key_hash=key_hash)
     sealed = build_bridge_token_response(identity, grant, keys, now)
     if not isinstance(sealed, SealedEnvelope):
         raise HTTPException(status_code=500, detail="Failed to mint the gateway-bound credential")
