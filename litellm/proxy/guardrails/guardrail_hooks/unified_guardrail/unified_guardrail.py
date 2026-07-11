@@ -8,7 +8,7 @@ Unified Guardrail, leveraging LiteLLM's /applyGuardrail endpoint
 
 import copy
 import json
-from typing import TYPE_CHECKING, Any, AsyncGenerator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, List, Optional, Union
 
 from fastapi import HTTPException
 
@@ -587,8 +587,7 @@ class UnifiedLLMGuardrails(CustomLogger):
             )
 
         saw_tool_calls = False
-        saw_text_content = False
-        deferred_finish_reason_for_text = False
+        state: dict[str, bool] = {"saw_text_content": False, "deferred_finish_reason_for_text": False}
 
         try:
             async for item in response:
@@ -609,18 +608,16 @@ class UnifiedLLMGuardrails(CustomLogger):
                 # transformed text).
                 if self._chunk_has_tool_calls(item):
                     saw_tool_calls = True
-                    has_text, has_text_and_finish = self._inspect_text_on_chunk(item)
-                    if has_text:
-                        saw_text_content = True
-                    if has_text_and_finish:
-                        deferred_finish_reason_for_text = True
-                    tool_only = self._tool_call_passthrough_chunk(
-                        item, finish_reason_per_choice=finish_reason_per_choice
-                    )
-                    responses_yielded.append(tool_only)
-                    yield tool_only
                     responses_so_far.append(item)
                     last_chunk = item
+                    async for out in self._handle_tool_call_chunk(
+                        item=item,
+                        state=state,
+                        finish_reason_per_choice=finish_reason_per_choice,
+                        responses_yielded=responses_yielded,
+                        run_round=_round,
+                    ):
+                        yield out
                     continue
 
                 chunk_counter += 1
@@ -628,7 +625,7 @@ class UnifiedLLMGuardrails(CustomLogger):
                 last_chunk = item
                 self._record_finish_reasons(item, finish_reason_per_choice)
                 if self._chunk_carries_text(item):
-                    saw_text_content = True
+                    state["saw_text_content"] = True
                 elif self._is_usage_only_chunk(item):
                     # A stream_options.include_usage terminal chunk carries no text
                     # and no tool calls; pass it through so clients keep receiving
@@ -667,11 +664,43 @@ class UnifiedLLMGuardrails(CustomLogger):
             # tool-call-only stream that already ran _inspect_full_response_for_block
             # would trigger a redundant second guardrail HTTP call at end of stream
             # with nothing new to emit.
-            if last_chunk is not None and (saw_text_content or deferred_finish_reason_for_text or not saw_tool_calls):
+            if last_chunk is not None and (
+                state["saw_text_content"] or state["deferred_finish_reason_for_text"] or not saw_tool_calls
+            ):
                 async for out in _round(last_chunk, is_final=True):
                     yield out
         except _StreamTerminated:
             return
+
+    async def _handle_tool_call_chunk(
+        self,
+        *,
+        item: Any,
+        state: dict,
+        finish_reason_per_choice: dict[int, Optional[str]],
+        responses_yielded: list[Any],
+        run_round: Callable[..., AsyncGenerator[Any, None]],
+    ) -> AsyncGenerator[Any, None]:
+        """Emit a tool-call-carrying chunk on the incremental_diff path.
+
+        Steps: mark tracking state, flush any accumulated but unemitted text via
+        a synthetic transform round BEFORE the passthrough (so an SSE-compliant
+        client that stops at the passthrough's ``finish_reason="tool_calls"``
+        does not miss the redaction), then emit a stripped tool-only passthrough.
+        The mixed content+tool_calls case is separately handled by
+        ``_tool_call_passthrough_chunk`` deferring finish_reason for that choice.
+        """
+        has_text, has_text_and_finish = self._inspect_text_on_chunk(item)
+        if has_text:
+            state["saw_text_content"] = True
+        if has_text_and_finish:
+            state["deferred_finish_reason_for_text"] = True
+        if state["saw_text_content"]:
+            async for out in run_round(item, is_final=False):
+                yield out
+        tool_only = self._tool_call_passthrough_chunk(item, finish_reason_per_choice=finish_reason_per_choice)
+        responses_yielded.append(tool_only)
+        yield tool_only
 
     async def _inspect_full_response_for_block(
         self,

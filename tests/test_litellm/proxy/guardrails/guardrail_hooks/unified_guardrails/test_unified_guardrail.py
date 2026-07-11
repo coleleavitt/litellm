@@ -658,10 +658,10 @@ class _StreamingTextGuardrail(CustomGuardrail):
     exercise the streaming underflow guard.
     """
 
-    def __init__(self, *, holdback_schedule=None, shrink_to=None, shrink_after=0):
+    def __init__(self, *, holdback_schedule=None, shrink_to=None, shrink_after=0, sampling_rate=1):
         super().__init__(guardrail_name="streaming-text-guardrail")
         self.streaming_transform_mode = "incremental_diff"
-        self.streaming_sampling_rate = 1
+        self.streaming_sampling_rate = sampling_rate
         self.streaming_end_of_stream_only = False
         self.guardrail_config = {}
         self._holdback_schedule = list(holdback_schedule or [])
@@ -1242,8 +1242,8 @@ class TestStreamingTransform:
 
         out = await _drive_stream(UnifiedLLMGuardrails(), guardrail, [mixed])
 
-        # Locate the passthrough (has tool_calls) and the transformed text chunk
-        # (has content but no tool_calls) for choice 0.
+        # Locate the passthrough (has tool_calls) and the transformed text chunks
+        # (content set, no tool_calls) for choice 0.
         passthrough_idx = next(
             i for i, item in enumerate(out) if item.choices and item.choices[0].delta.tool_calls
         )
@@ -1253,15 +1253,19 @@ class TestStreamingTransform:
             if item.choices and (item.choices[0].delta.content or "") and not item.choices[0].delta.tool_calls
         ]
         assert text_idxs, "transformed text chunk missing"
-        # The passthrough must precede the text chunk (order preserved).
-        assert passthrough_idx < text_idxs[-1]
-        # And finish_reason must live on a chunk at or after the last text chunk,
-        # not before it. The passthrough for a mixed-content chunk MUST NOT carry
-        # finish_reason.
+        # For mixed content+tool_call chunks the pre-flush emits transformed text
+        # BEFORE the passthrough (so an SSE client stopping at finish_reason still
+        # sees the redaction). The passthrough itself MUST NOT carry finish_reason
+        # (it is deferred to a terminator chunk that follows).
+        assert min(text_idxs) < passthrough_idx
         assert out[passthrough_idx].choices[0].finish_reason is None
-        # The final text chunk owns the finish_reason.
-        final_finish = out[text_idxs[-1]].choices[0].finish_reason
-        assert final_finish == "tool_calls"
+        # A terminator chunk after the passthrough owns the finish_reason for the
+        # deferred choice. Search all output for finish_reason="tool_calls".
+        finish_carriers = [i for i, item in enumerate(out) if item.choices and item.choices[0].finish_reason == "tool_calls"]
+        assert finish_carriers, "finish_reason=tool_calls never delivered"
+        # And the redacted text ("SECRET") reached the wire.
+        combined = "".join(out[i].choices[0].delta.content or "" for i in text_idxs)
+        assert "SECRET" in combined
 
     @pytest.mark.asyncio
     async def test_tool_call_only_chunk_preserves_finish_reason_on_passthrough(self):
@@ -1354,6 +1358,65 @@ class TestStreamingTransform:
         usage_out = [item for item in out if getattr(item, "usage", None)]
         assert usage_out, "usage chunk missing from forwarded stream"
         assert usage_out[0].usage["total_tokens"] == 5
+
+    @pytest.mark.asyncio
+    async def test_text_flush_precedes_tool_call_passthrough_under_default_sampling(self):
+        """With the default ``streaming_sampling_rate`` (e.g. 5) and fewer text
+        chunks than the sampling boundary before the first tool-call chunk, the
+        tool-call passthrough would previously carry ``finish_reason="tool_calls"``
+        without any preceding synthetic text delta. SSE-compliant clients stop
+        reading at finish_reason and drop the redacted text that the end-of-stream
+        _round would otherwise emit *after* the passthrough. The fix flushes
+        accumulated text via a synthetic delta BEFORE yielding the tool-call
+        passthrough, so redacted text arrives on the wire before finish_reason."""
+        # Sampling rate 5 means no mid-stream round would fire on 2 text chunks
+        # without the pre-tool-call flush.
+        guardrail = _StreamingTextGuardrail(sampling_rate=5)
+
+        chunks = [
+            _stream_chunk("hello "),
+            _stream_chunk("world"),
+            ModelResponseStream(
+                choices=[
+                    StreamingChoices(
+                        index=0,
+                        delta=Delta(
+                            content=None,
+                            role="assistant",
+                            tool_calls=[
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "f", "arguments": "{}"},
+                                }
+                            ],
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+            ),
+        ]
+
+        out = await _drive_stream(UnifiedLLMGuardrails(), guardrail, chunks)
+
+        # Identify the synthetic transformed-text chunks (content set, no
+        # tool_calls) and the tool-call passthrough (tool_calls set).
+        text_indices = [
+            i
+            for i, item in enumerate(out)
+            if item.choices and (item.choices[0].delta.content or "") and not item.choices[0].delta.tool_calls
+        ]
+        tool_indices = [i for i, item in enumerate(out) if item.choices and item.choices[0].delta.tool_calls]
+
+        assert text_indices, "transformed text was never emitted to the client"
+        assert tool_indices, "tool-call passthrough missing"
+        # The transformed text must arrive BEFORE the tool-call chunk carrying
+        # finish_reason. That's the whole SSE contract this fix restores.
+        assert max(text_indices) < min(tool_indices)
+        # Transformed content should be the uppercase of the accumulated text.
+        transformed = "".join(out[i].choices[0].delta.content or "" for i in text_indices)
+        assert "HELLO WORLD" in transformed
 
     @pytest.mark.asyncio
     async def test_guardrail_always_sees_raw_accumulated_text(self):

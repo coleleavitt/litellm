@@ -357,11 +357,20 @@ class GenericGuardrailAPI(CustomGuardrail):
     ) -> GenericGuardrailAPIInputs:
         # Action is NONE or no modifications needed
         return_inputs = GenericGuardrailAPIInputs(texts=texts)
-        # ``is not None`` preserves an explicit empty list (a guardrail suppressing
-        # the entire response). Treating ``[]`` as falsy would restore the input
-        # texts and silently leak content the guardrail intended to remove.
-        if guardrail_response.texts is not None:
-            return_inputs["texts"] = guardrail_response.texts
+        # For the incremental_diff streaming path an explicit empty texts list is a
+        # "suppress the whole response" signal from the guardrail, so we must NOT
+        # fall back to the raw input (which would leak content the guardrail
+        # intended to remove). For block_only and non-streaming callers the
+        # historical contract treats texts=[] the same as "no change" (guardrails
+        # in the wild use it as a no-op signal), and switching to is-not-None
+        # unconditionally would silently break those deployments. Gate the new
+        # semantic on the streaming_transform_mode.
+        if self.streaming_transform_mode == "incremental_diff":
+            if guardrail_response.texts is not None:
+                return_inputs["texts"] = guardrail_response.texts
+        else:
+            if guardrail_response.texts:
+                return_inputs["texts"] = guardrail_response.texts
         if guardrail_response.images:
             return_inputs["images"] = guardrail_response.images
         elif images:

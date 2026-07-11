@@ -1403,26 +1403,57 @@ class TestGenericGuardrailAPIResponseParsing:
         assert result["stream_holdback_chars"] == [5]
 
     @pytest.mark.asyncio
-    async def test_empty_texts_response_suppresses_input_texts(self, generic_guardrail):
-        """A GUARDRAIL_INTERVENED response with an explicit empty texts list must
-        suppress the input texts, not restore them. Prior behavior treated ``[]``
-        as falsy and fell back to the raw input, silently leaking content the
-        guardrail intended to remove."""
+    async def test_empty_texts_response_under_incremental_diff_suppresses_input(self):
+        """Under streaming_transform_mode=incremental_diff, a GUARDRAIL_INTERVENED
+        response with an explicit empty texts list must suppress the input texts —
+        that is the signal a rewrite-mode guardrail uses to drop content entirely.
+        Falling back to the raw input would leak content the guardrail intended
+        to remove."""
+        guardrail = GenericGuardrailAPI(
+            api_base="https://api.test.guardrail.com",
+            headers={"Authorization": "Bearer test-key"},
+            guardrail_name="test-generic-guardrail",
+            event_hook="post_call",
+            default_on=True,
+            streaming_transform_mode="incremental_diff",
+        )
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "action": "GUARDRAIL_INTERVENED",
-            "texts": [],
-        }
+        mock_response.json.return_value = {"action": "GUARDRAIL_INTERVENED", "texts": []}
         mock_response.raise_for_status = MagicMock()
 
-        with patch.object(generic_guardrail.async_handler, "post", return_value=mock_response):
-            result = await generic_guardrail.apply_guardrail(
+        with patch.object(guardrail.async_handler, "post", return_value=mock_response):
+            result = await guardrail.apply_guardrail(
                 inputs={"texts": ["sensitive prompt"]},
                 request_data={},
                 input_type="response",
             )
 
         assert result["texts"] == []
+
+    @pytest.mark.asyncio
+    async def test_empty_texts_response_under_block_only_preserves_input(self, generic_guardrail):
+        """Under the default block_only path (and non-streaming callers), an
+        existing guardrail returning texts=[] as a "no-op signal" must continue
+        to pass through the raw input. This preserves the historical contract
+        for deployed guardrails; the is-not-None semantic is opt-in via
+        streaming_transform_mode=incremental_diff."""
+        # Fixture defaults to streaming_transform_mode=None → "block_only".
+        assert generic_guardrail.streaming_transform_mode == "block_only"
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"action": "GUARDRAIL_INTERVENED", "texts": []}
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(generic_guardrail.async_handler, "post", return_value=mock_response):
+            result = await generic_guardrail.apply_guardrail(
+                inputs={"texts": ["existing user input"]},
+                request_data={},
+                input_type="response",
+            )
+
+        # Historical no-op contract: empty texts is treated as "no change",
+        # input passes through.
+        assert result["texts"] == ["existing user input"]
 
 
 class TestGenericGuardrailAPIStreamingViaUnified:
