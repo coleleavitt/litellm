@@ -61,7 +61,7 @@ from litellm._lazy_imports import (
 )
 from litellm._uuid import uuid
 from litellm.litellm_core_utils.fallback_generalizations import (
-    match_fallback_generalization,
+    match_all_fallback_generalizations,
 )
 from litellm.constants import (
     DEFAULT_CHAT_COMPLETION_PARAM_VALUES,
@@ -2619,8 +2619,9 @@ _CACHE_PRICING_FIELDS = (
 
 def _resolve_builtin_model_cost_entry(key: str, provider: str) -> Optional[Dict[str, Any]]:
     """Best-effort lookup of a built-in ``model_cost`` entry for a custom key
-    whose shape ``get_model_info`` cannot resolve (double provider prefixes
-    like ``bedrock/bedrock/us.anthropic.claude-sonnet-4-6`` or region aliases).
+    whose shape ``get_model_info`` cannot resolve (repeated provider prefixes
+    like ``bedrock/bedrock/bedrock/us.anthropic.claude-sonnet-4-6`` or region
+    aliases).
 
     Returns a copy of the matching entry so the caller can inherit its defaults
     (most importantly cache pricing) without mutating the shared built-in.
@@ -5045,23 +5046,22 @@ def _get_model_info_from_generalization(
     """Resolve an unmapped model via a declarative fallback-generalization rule.
 
     Tries the same name candidates as the exact lookups, in the same order, and
-    returns ``(matched_name, model_info)`` for the first candidate whose rule also
-    satisfies the provider constraint. O(number of rules); only call after the
-    exact lookups have missed.
+    returns ``(matched_name, model_info)`` for the first matching rule that also
+    satisfies the provider constraint; a rule scoped to another provider is
+    skipped in favor of later rules rather than discarding the candidate.
+    O(number of rules); only call after the exact lookups have missed.
     """
     candidates = [
         potential_model_names["combined_model_name"],
         model,
+        potential_model_names["split_model"],
         potential_model_names["combined_stripped_model_name"],
         potential_model_names["stripped_model_name"],
-        potential_model_names["split_model"],
     ]
     for candidate in candidates:
-        generalized_info = match_fallback_generalization(candidate)
-        if generalized_info is not None and _check_provider_match(
-            model_info=generalized_info, custom_llm_provider=custom_llm_provider
-        ):
-            return candidate, generalized_info
+        for generalized_info in match_all_fallback_generalizations(candidate):
+            if _check_provider_match(model_info=generalized_info, custom_llm_provider=custom_llm_provider):
+                return candidate, generalized_info
     return None
 
 
@@ -5093,6 +5093,11 @@ def _get_potential_model_names(
             custom_llm_provider,
             stripped_model_name,
         )
+
+    if custom_llm_provider in ("bedrock", "bedrock_converse"):
+        from litellm.llms.bedrock.common_utils import strip_bedrock_routing_prefix
+
+        split_model = strip_bedrock_routing_prefix(split_model)
 
     return PotentialModelNamesAndCustomLLMProvider(
         split_model=split_model,
@@ -5261,9 +5266,9 @@ def _get_model_info_helper(
             Check if: (in order of specificity)
             1. 'custom_llm_provider/model' in litellm.model_cost. Checks "groq/llama3-8b-8192" if model="llama3-8b-8192" and custom_llm_provider="groq"
             2. 'model' in litellm.model_cost. Checks "gemini-1.5-pro-002" in  litellm.model_cost if model="gemini-1.5-pro-002" and custom_llm_provider=None
-            3. 'combined_stripped_model_name' in litellm.model_cost. Checks if 'gemini/gemini-1.5-flash' in model map, if 'gemini/gemini-1.5-flash-001' given.
-            4. 'stripped_model_name' in litellm.model_cost. Checks if 'ft:gpt-3.5-turbo' in model map, if 'ft:gpt-3.5-turbo:my-org:custom_suffix:id' given.
-            5. 'split_model' in litellm.model_cost. Checks "llama3-8b-8192" in litellm.model_cost if model="groq/llama3-8b-8192"
+            3. 'split_model' in litellm.model_cost. Checks "au.anthropic.claude-opus-4-8" in litellm.model_cost if model="bedrock/au.anthropic.claude-opus-4-8"
+            4. 'combined_stripped_model_name' in litellm.model_cost. Checks if 'gemini/gemini-1.5-flash' in model map, if 'gemini/gemini-1.5-flash-001' given.
+            5. 'stripped_model_name' in litellm.model_cost. Checks if 'ft:gpt-3.5-turbo' in model map, if 'ft:gpt-3.5-turbo:my-org:custom_suffix:id' given.
             """
 
             _model_info: Optional[Dict[str, Any]] = None
@@ -5290,6 +5295,16 @@ def _get_model_info_helper(
                     ):
                         _model_info = None
             if _model_info is None:
+                _matched_key = _get_model_cost_key(split_model)
+                if _matched_key is not None:
+                    key = _matched_key
+                    _model_info = _get_model_info_from_model_cost(key=cast(str, key))
+                    if not _check_provider_match(
+                        model_info=_model_info,
+                        custom_llm_provider=model_cost_custom_llm_provider,
+                    ):
+                        _model_info = None
+            if _model_info is None:
                 _matched_key = _get_model_cost_key(combined_stripped_model_name)
                 if _matched_key is not None:
                     key = _matched_key
@@ -5301,16 +5316,6 @@ def _get_model_info_helper(
                         _model_info = None
             if _model_info is None:
                 _matched_key = _get_model_cost_key(stripped_model_name)
-                if _matched_key is not None:
-                    key = _matched_key
-                    _model_info = _get_model_info_from_model_cost(key=cast(str, key))
-                    if not _check_provider_match(
-                        model_info=_model_info,
-                        custom_llm_provider=model_cost_custom_llm_provider,
-                    ):
-                        _model_info = None
-            if _model_info is None:
-                _matched_key = _get_model_cost_key(split_model)
                 if _matched_key is not None:
                     key = _matched_key
                     _model_info = _get_model_info_from_model_cost(key=cast(str, key))
@@ -5466,6 +5471,7 @@ def _get_model_info_helper(
                 supports_url_context=_model_info.get("supports_url_context", None),
                 supports_reasoning=_model_info.get("supports_reasoning", None),
                 supports_adaptive_thinking=_model_info.get("supports_adaptive_thinking", None),
+                supports_mid_conversation_system=_model_info.get("supports_mid_conversation_system", None),
                 supports_none_reasoning_effort=_model_info.get("supports_none_reasoning_effort", None),
                 supports_minimal_reasoning_effort=_model_info.get("supports_minimal_reasoning_effort", None),
                 supports_low_reasoning_effort=_model_info.get("supports_low_reasoning_effort", None),
@@ -8022,6 +8028,16 @@ class ProviderConfigManager:
                 )
 
                 return GithubCopilotAnthropicMessagesConfig()
+
+        from litellm.llms.openai_like.json_loader import JSONProviderRegistry
+
+        json_provider = JSONProviderRegistry.get(provider.value)
+        if json_provider is not None and "/v1/messages" in json_provider.supported_endpoints:
+            from litellm.llms.openai_like.messages.transformation import (
+                JSONProviderAnthropicMessagesConfig,
+            )
+
+            return JSONProviderAnthropicMessagesConfig(json_provider)
         return None
 
     @staticmethod
@@ -8097,6 +8113,12 @@ class ProviderConfigManager:
             )
 
             return SonioxAudioTranscriptionConfig()
+        elif litellm.LlmProviders.VERTEX_AI == provider:
+            from litellm.llms.vertex_ai.audio_transcription.transformation import (
+                VertexAIAudioTranscriptionConfig,
+            )
+
+            return VertexAIAudioTranscriptionConfig()
         return None
 
     @staticmethod
