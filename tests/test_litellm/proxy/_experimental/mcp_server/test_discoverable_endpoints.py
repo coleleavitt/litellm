@@ -4365,7 +4365,7 @@ async def test_register_bridge_relay_never_persists():
 _BRIDGE_MASTER_KEY = "sk-bridge-producer-master-key-0123456789abcdef"
 
 
-async def _exchange_for_bridge_server(server, upstream_body, key_hash):
+async def _exchange_for_bridge_server(server, upstream_body, key_hash, code="auth-code", fake_client_out=None):
     from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
         exchange_token_with_server,
     )
@@ -4375,6 +4375,8 @@ async def _exchange_for_bridge_server(server, upstream_body, key_hash):
     fake_http_response.raise_for_status = MagicMock()
     fake_http_client = MagicMock()
     fake_http_client.post = AsyncMock(return_value=fake_http_response)
+    if fake_client_out is not None:
+        fake_client_out["client"] = fake_http_client
 
     with (
         patch(
@@ -4391,7 +4393,7 @@ async def _exchange_for_bridge_server(server, upstream_body, key_hash):
             request=_bridge_mock_request(),
             mcp_server=server,
             grant_type="authorization_code",
-            code="auth-code",
+            code=code,
             redirect_uri="https://claude.ai/api/mcp/auth_callback",
             client_id="dcr-client-123",
             client_secret=None,
@@ -4432,6 +4434,193 @@ async def test_oauth_delegate_bridge_token_exchange_mints_envelope_not_raw_token
     assert opened.identity.subject_type == "key_hash"
     assert opened.identity.subject == "hashed-litellm-key-77"
     assert opened.upstream_authorization.get_secret_value() == "Bearer UPSTREAM-SECRET-TOKEN"
+
+
+def test_bridge_authorization_code_round_trips_and_rejects_hostile_input():
+    """The gateway authorization code seals and recovers the upstream code and the SSO user, and is
+    total over hostile input: a raw upstream code (scripted path) opens to None, and a tampered or
+    non-gateway value opens to None rather than raising."""
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+        is_bridge_authorization_code,
+        open_bridge_authorization_code,
+        seal_bridge_authorization_code,
+    )
+
+    with patch("litellm.proxy.proxy_server.master_key", _BRIDGE_MASTER_KEY):
+        sealed = seal_bridge_authorization_code(
+            upstream_code="up-code", litellm_user_id="sso-user-9", mcp_server_id="srv-1"
+        )
+        assert is_bridge_authorization_code(sealed)
+        opened = open_bridge_authorization_code(sealed)
+        assert opened is not None
+        assert opened.upstream_code == "up-code"
+        assert opened.litellm_user_id == "sso-user-9"
+        assert opened.mcp_server_id == "srv-1"
+        assert open_bridge_authorization_code("raw-upstream-code") is None
+        assert open_bridge_authorization_code(sealed[:-4] + "aaaa") is None
+
+
+@pytest.mark.asyncio
+async def test_interactive_bridge_token_exchange_mints_user_subject_envelope():
+    """An interactive dcr_bridge oauth_delegate exchange (the client presents the gateway code the
+    callback sealed, and NO litellm key) mints an envelope bound to the SSO-captured user: it opens
+    to a user_id subject, and the upstream exchange used the real upstream code recovered from the
+    gateway code, not the sealed wrapper."""
+    from datetime import datetime, timezone
+
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+        seal_bridge_authorization_code,
+    )
+    from litellm.proxy._experimental.mcp_server.outbound_credentials.bridge_credentials import (
+        BridgeEnvelopeAdmitted,
+        envelope_keys_from_master_key,
+        resolve_bridge_envelope,
+    )
+    from litellm.types.mcp import MCPAuth
+
+    server = _bridge_server(auth_type=MCPAuth.oauth_delegate)
+    with patch("litellm.proxy.proxy_server.master_key", _BRIDGE_MASTER_KEY):
+        gateway_code = seal_bridge_authorization_code(
+            upstream_code="REAL-UPSTREAM-CODE", litellm_user_id="sso-user-42", mcp_server_id=server.server_id
+        )
+    upstream = {"access_token": "UPSTREAM-SECRET-TOKEN", "token_type": "Bearer", "expires_in": 3600}
+    captured: dict = {}
+    response = await _exchange_for_bridge_server(
+        server, upstream, key_hash=None, code=gateway_code, fake_client_out=captured
+    )
+
+    token = json.loads(response.body)["access_token"]
+    keys = envelope_keys_from_master_key(_BRIDGE_MASTER_KEY)
+    opened = resolve_bridge_envelope(token, keys, datetime.now(timezone.utc), server.server_id)
+    assert isinstance(opened, BridgeEnvelopeAdmitted)
+    assert opened.identity.subject_type == "user_id"
+    assert opened.identity.subject == "sso-user-42"
+    assert opened.upstream_authorization.get_secret_value() == "Bearer UPSTREAM-SECRET-TOKEN"
+    assert captured["client"].post.call_args.kwargs["data"]["code"] == "REAL-UPSTREAM-CODE"
+
+
+@pytest.mark.asyncio
+async def test_interactive_bridge_gateway_code_for_another_server_is_rejected_400():
+    """A gateway authorization code is bound to the server it was minted for: presenting it at another
+    server's token endpoint is a 400, so a code cannot be replayed across a server boundary."""
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+        seal_bridge_authorization_code,
+    )
+    from litellm.types.mcp import MCPAuth
+
+    server = _bridge_server(auth_type=MCPAuth.oauth_delegate)
+    with patch("litellm.proxy.proxy_server.master_key", _BRIDGE_MASTER_KEY):
+        gateway_code = seal_bridge_authorization_code(
+            upstream_code="up-code", litellm_user_id="sso-user-42", mcp_server_id="a-different-server-id"
+        )
+    upstream = {"access_token": "UPSTREAM-SECRET-TOKEN", "token_type": "Bearer", "expires_in": 3600}
+    with pytest.raises(HTTPException) as exc:
+        await _exchange_for_bridge_server(server, upstream, key_hash=None, code=gateway_code)
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_interactive_bridge_authorize_seals_sso_user_into_state():
+    """On the short-circuit bridge oauth_delegate arm, authorize captures the SSO user from the UI
+    session cookie and seals it (and the target server) into the encrypted OAuth state, so the
+    callback can later mint a user-bound gateway code; it still proceeds to the upstream redirect."""
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import authorize_with_server
+    from litellm.types.mcp import MCPAuth
+
+    server = _bridge_server(auth_type=MCPAuth.oauth_delegate, client_id="admin-client", registration_url=None)
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return "mocked_encrypted_state"
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.byok_oauth_endpoints._user_id_from_session_cookie",
+            return_value="sso-user-42",
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints.encode_state_with_base_url",
+            side_effect=_capture,
+        ),
+    ):
+        response = await authorize_with_server(
+            request=_bridge_mock_request(),
+            mcp_server=server,
+            client_id="ignored",
+            redirect_uri="http://127.0.0.1:60108/callback",
+            state="s",
+            code_challenge="chal",
+            code_challenge_method="S256",
+        )
+
+    assert captured["litellm_user_id"] == "sso-user-42"
+    assert captured["mcp_server_id"] == server.server_id
+    assert "/sso/key/generate" not in response.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_bridge_authorize_without_session_redirects_to_login():
+    """Without a UI session there is no identity to bind, so the short-circuit bridge oauth_delegate
+    authorize sends the browser through litellm login instead of proceeding to the upstream."""
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import authorize_with_server
+    from litellm.types.mcp import MCPAuth
+
+    server = _bridge_server(auth_type=MCPAuth.oauth_delegate, client_id="admin-client", registration_url=None)
+    with patch(
+        "litellm.proxy._experimental.mcp_server.byok_oauth_endpoints._user_id_from_session_cookie",
+        return_value=None,
+    ):
+        response = await authorize_with_server(
+            request=_bridge_mock_request(),
+            mcp_server=server,
+            client_id="ignored",
+            redirect_uri="http://127.0.0.1:60108/callback",
+            state="s",
+            code_challenge="chal",
+            code_challenge_method="S256",
+        )
+    assert "/sso/key/generate" in response.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_bridge_callback_seals_user_into_gateway_code():
+    """When the OAuth state carries the captured SSO user, the callback forwards a gateway
+    authorization code (sealing the user and upstream code) to the client instead of the raw upstream
+    code, so the client's later token call can prove who signed in."""
+    from urllib.parse import parse_qs, urlparse
+
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+        callback,
+        is_bridge_authorization_code,
+    )
+
+    state_data = {
+        "original_state": "client-state",
+        "client_redirect_uri": "http://127.0.0.1:60108/cb",
+        "base_url": "http://127.0.0.1:60108/cb",
+        "litellm_user_id": "sso-user-42",
+        "mcp_server_id": "bridge_srv",
+    }
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints._resolve_encoded_oauth_state",
+            return_value="enc",
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints.decode_state_hash",
+            return_value=state_data,
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints._get_validated_client_redirect_uri",
+            return_value="http://127.0.0.1:60108/cb",
+        ),
+        patch("litellm.proxy.proxy_server.master_key", _BRIDGE_MASTER_KEY),
+    ):
+        response = await callback(request=_bridge_mock_request(), code="REAL-UPSTREAM-CODE", state="relay")
+
+    forwarded_code = parse_qs(urlparse(response.headers["location"]).query)["code"][0]
+    assert is_bridge_authorization_code(forwarded_code)
 
 
 @pytest.mark.asyncio
