@@ -168,6 +168,34 @@ class GenericGuardrailAPI(CustomGuardrail):
         "blocked_reason": str (optional, only if action is BLOCKED),
         "text": str (optional, modified text if action is GUARDRAIL_INTERVENED)
     }
+
+    Streaming behavior:
+        Four optional config keys tune what the guardrail does on streamed responses:
+
+        - ``streaming_transform_mode`` (``"block_only"`` (default) | ``"incremental_diff"``):
+          ``block_only`` runs the guardrail on the assembled stream and terminates it if
+          the guardrail returns BLOCKED, but text rewrites (GUARDRAIL_INTERVENED with
+          modified ``texts``) are dropped. ``incremental_diff`` withholds the raw chunks
+          and emits the guardrail's rewritten text as synthetic deltas, computed by
+          diffing the mutated accumulated text against what has already been streamed;
+          this is what enables PII masking, pseudonym reversal, redaction, and similar
+          rewrites over the wire. v1 supports ``incremental_diff`` only on the OpenAI
+          chat completions streaming path (string ``delta.content``); other routes
+          silently fall back to ``block_only``. Tool-call chunks pass through raw and
+          are inspected for a block decision at end of stream, never text-rewritten.
+        - ``streaming_sampling_rate`` (int, default 5): run the guardrail every Nth
+          accumulated chunk during a stream. Higher = fewer guardrail invocations.
+        - ``streaming_end_of_stream_only`` (bool, default False): if True, invoke the
+          guardrail once at end of stream only (no mid-stream rounds); overrides
+          ``streaming_sampling_rate``.
+
+        Guardrail servers running under ``incremental_diff`` may return, alongside the
+        rewritten ``texts``, a ``stream_holdback_chars: [N, ...]`` array (one entry per
+        choice) telling the framework how many trailing chars to withhold from emission
+        this round for word-boundary safety across rounds. Malformed values degrade
+        silently to 0. The framework fails closed (HTTP 400 ``stream_transform_underflow``)
+        when a rewrite would retract bytes already sent to the client; a guardrail that
+        needs to rewrite recent output must withhold it first via ``stream_holdback_chars``.
     """
 
     def __init__(

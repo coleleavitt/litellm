@@ -16,6 +16,35 @@ litellm_settings:
         api_base: http://localhost:8080  # Required. Endpoint /beta/litellm_basic_guardrail_api is automatically appended
         unreachable_fallback: fail_closed  # Options: fail_closed (default, raise), fail_open (proceed if endpoint unreachable or upstream returns 502/503/504)
         default_on: false  # Set to true to apply to all requests by default
+
+        # --- Streaming controls (all optional) ---
+        # streaming_transform_mode:
+        #   "block_only" (default) preserves historical behavior on streams: the guardrail
+        #     can terminate a stream via a BLOCK action, but text rewrites returned as
+        #     GUARDRAIL_INTERVENED are dropped.
+        #   "incremental_diff" emits the guardrail's rewritten text as synthetic deltas by
+        #     diffing the mutated accumulated text against what has already been streamed.
+        #     Enables PII masking, pseudonym reversal, redaction, etc. over streaming.
+        #     v1 supports only the OpenAI chat completions streaming path; other routes
+        #     silently fall back to block_only. Tool-call chunks pass through raw and are
+        #     inspected for a block decision at end of stream (never text-rewritten in v1).
+        streaming_transform_mode: block_only
+
+        # How often (every Nth accumulated chunk) the guardrail runs during a stream.
+        # Higher = fewer guardrail calls, more chunks per call. Default 5.
+        streaming_sampling_rate: 5
+
+        # If true, invoke the guardrail once at end of stream only (no mid-stream rounds).
+        # Overrides streaming_sampling_rate. Default false.
+        streaming_end_of_stream_only: false
+
+        # Guardrail servers using incremental_diff can also return, alongside "texts", a
+        # "stream_holdback_chars": [N, ...] array (one entry per choice) telling the
+        # framework how many trailing chars to withhold from streaming emission this round
+        # (word-boundary safety, e.g. pause on "Thomas W" until the next chunk arrives so
+        # the guardrail can decide whether to redact "Thomas Weber"). No config key here;
+        # this is part of the guardrail server response contract.
+
         additional_provider_specific_params:
           # Any additional parameters your guardrail API needs
           api_version: "v1"
