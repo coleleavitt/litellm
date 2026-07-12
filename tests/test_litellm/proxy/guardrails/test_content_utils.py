@@ -526,9 +526,6 @@ def test_apply_redacted_messages_back_skips_input_when_not_string():
     assert data["input"] == [{"type": "text", "text": "leak"}]
 
 
-# -------------------------------------------------------------------
-# LIT-4303: reasoning.summary_text walking
-# -------------------------------------------------------------------
 
 def test_iter_message_text_walks_reasoning_summary_text():
     """Reasoning items with summary_text parts should yield their text."""
