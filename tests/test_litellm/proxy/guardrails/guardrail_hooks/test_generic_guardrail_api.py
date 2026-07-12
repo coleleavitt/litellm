@@ -1403,43 +1403,15 @@ class TestGenericGuardrailAPIResponseParsing:
         assert result["stream_holdback_chars"] == [5]
 
     @pytest.mark.asyncio
-    async def test_empty_texts_response_under_incremental_diff_suppresses_input(self):
-        """Under streaming_transform_mode=incremental_diff, a GUARDRAIL_INTERVENED
-        response with an explicit empty texts list must suppress the input texts —
-        that is the signal a rewrite-mode guardrail uses to drop content entirely.
-        Falling back to the raw input would leak content the guardrail intended
-        to remove."""
-        guardrail = GenericGuardrailAPI(
-            api_base="https://api.test.guardrail.com",
-            headers={"Authorization": "Bearer test-key"},
-            guardrail_name="test-generic-guardrail",
-            event_hook="post_call",
-            default_on=True,
-            streaming_transform_mode="incremental_diff",
-        )
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"action": "GUARDRAIL_INTERVENED", "texts": []}
-        mock_response.raise_for_status = MagicMock()
-
-        with patch.object(guardrail.async_handler, "post", return_value=mock_response):
-            result = await guardrail.apply_guardrail(
-                inputs={"texts": ["sensitive prompt"]},
-                request_data={},
-                input_type="response",
-            )
-
-        assert result["texts"] == []
-
-    @pytest.mark.asyncio
-    async def test_empty_texts_response_under_block_only_preserves_input(self, generic_guardrail):
-        """Under the default block_only path (and non-streaming callers), an
-        existing guardrail returning texts=[] as a "no-op signal" must continue
-        to pass through the raw input. This preserves the historical contract
-        for deployed guardrails; the is-not-None semantic is opt-in via
-        streaming_transform_mode=incremental_diff."""
-        # Fixture defaults to streaming_transform_mode=None → "block_only".
-        assert generic_guardrail.streaming_transform_mode == "block_only"
-
+    async def test_empty_texts_response_preserves_input_regardless_of_mode(self, generic_guardrail):
+        """Known limitation, documented in ``_build_guardrail_return_inputs``: an
+        explicit empty ``texts: []`` from the guardrail is treated as a no-op
+        signal (input passes through) across ALL modes, including
+        ``streaming_transform_mode="incremental_diff"``. This preserves the
+        historical contract for deployed guardrails; overloading ``[]`` to mean
+        "suppress the whole response" would be a silent breaking change. If a
+        genuine suppression primitive is needed, it will be added as a distinct
+        action code in a future PR."""
         mock_response = MagicMock()
         mock_response.json.return_value = {"action": "GUARDRAIL_INTERVENED", "texts": []}
         mock_response.raise_for_status = MagicMock()
@@ -1451,8 +1423,6 @@ class TestGenericGuardrailAPIResponseParsing:
                 input_type="response",
             )
 
-        # Historical no-op contract: empty texts is treated as "no change",
-        # input passes through.
         assert result["texts"] == ["existing user input"]
 
 

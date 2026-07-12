@@ -196,6 +196,13 @@ class GenericGuardrailAPI(CustomGuardrail):
         silently to 0. The framework fails closed (HTTP 400 ``stream_transform_underflow``)
         when a rewrite would retract bytes already sent to the client; a guardrail that
         needs to rewrite recent output must withhold it first via ``stream_holdback_chars``.
+
+        Known limitation: an explicit ``texts: []`` in a ``GUARDRAIL_INTERVENED``
+        response is treated as a no-op (input passes through) across all modes,
+        including ``incremental_diff``. This preserves the historical contract for
+        deployed guardrails; a genuine "suppress the whole response" primitive on
+        the streaming transform path is deferred to a future PR (likely as a new
+        action code rather than overloading ``[]``).
     """
 
     def __init__(
@@ -357,20 +364,18 @@ class GenericGuardrailAPI(CustomGuardrail):
     ) -> GenericGuardrailAPIInputs:
         # Action is NONE or no modifications needed
         return_inputs = GenericGuardrailAPIInputs(texts=texts)
-        # For the incremental_diff streaming path an explicit empty texts list is a
-        # "suppress the whole response" signal from the guardrail, so we must NOT
-        # fall back to the raw input (which would leak content the guardrail
-        # intended to remove). For block_only and non-streaming callers the
-        # historical contract treats texts=[] the same as "no change" (guardrails
-        # in the wild use it as a no-op signal), and switching to is-not-None
-        # unconditionally would silently break those deployments. Gate the new
-        # semantic on the streaming_transform_mode.
-        if self.streaming_transform_mode == "incremental_diff":
-            if guardrail_response.texts is not None:
-                return_inputs["texts"] = guardrail_response.texts
-        else:
-            if guardrail_response.texts:
-                return_inputs["texts"] = guardrail_response.texts
+        # NOTE: known limitation on the incremental_diff streaming path — an
+        # explicit empty ``texts: []`` (a rewrite-mode guardrail asking to
+        # suppress the whole response) is treated the same as "no change" here,
+        # because the historical block_only / non-streaming contract has always
+        # treated ``[]`` as a no-op signal that leaves the input untouched.
+        # Overloading this semantic just for incremental_diff would silently
+        # break every deployed guardrail returning ``texts: []`` as a no-op.
+        # If a genuine "suppress the whole response" primitive is needed on the
+        # streaming transform path in the future, introduce a distinct signal
+        # (e.g. a new ``SUPPRESSED`` action code) rather than overloading ``[]``.
+        if guardrail_response.texts:
+            return_inputs["texts"] = guardrail_response.texts
         if guardrail_response.images:
             return_inputs["images"] = guardrail_response.images
         elif images:

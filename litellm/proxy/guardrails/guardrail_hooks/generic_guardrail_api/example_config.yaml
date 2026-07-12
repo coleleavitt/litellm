@@ -44,6 +44,12 @@ litellm_settings:
         # (word-boundary safety, e.g. pause on "Thomas W" until the next chunk arrives so
         # the guardrail can decide whether to redact "Thomas Weber"). No config key here;
         # this is part of the guardrail server response contract.
+        #
+        # Known limitation: a guardrail returning action=GUARDRAIL_INTERVENED with
+        # texts=[] is treated as a no-op across ALL modes, including incremental_diff.
+        # This preserves the historical contract for existing guardrails using empty
+        # texts as a "no change" signal. A dedicated suppression primitive for the
+        # streaming transform path is deferred to a future PR.
 
         additional_provider_specific_params:
           # Any additional parameters your guardrail API needs
