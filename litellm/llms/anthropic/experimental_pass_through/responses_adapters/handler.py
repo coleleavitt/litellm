@@ -5,7 +5,7 @@ Used when the target model is an OpenAI or Azure model.
 """
 
 import os
-from typing import Any, AsyncIterator, Coroutine, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Coroutine, Dict, List, Optional, Union, cast
 
 import litellm
 from litellm.types.llms.anthropic import AnthropicMessagesRequest
@@ -14,6 +14,7 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 )
 from litellm.types.llms.openai import ResponsesAPIResponse
 
+from ..adapters.transformation import create_tool_name_mapping
 from .streaming_iterator import AnthropicResponsesStreamWrapper
 from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 
@@ -24,6 +25,10 @@ _CLAUDE_CODE_PER_TURN_USAGE = os.getenv("LITELLM_CLAUDE_CODE_PER_TURN_USAGE", ""
     "yes",
     "on",
 }
+
+
+def _create_tool_name_mapping(tools: Optional[List[Dict]]) -> Dict[str, str]:
+    return create_tool_name_mapping(cast(List[Dict[str, Any]], tools or []))
 
 
 def _build_responses_kwargs(
@@ -147,6 +152,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
         output_format: Optional[Dict] = None,
         **kwargs,
     ) -> Union[AnthropicMessagesResponse, AsyncIterator]:
+        tool_name_mapping = _create_tool_name_mapping(tools)
         responses_kwargs = _build_responses_kwargs(
             max_tokens=max_tokens,
             messages=messages,
@@ -180,7 +186,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
         if not isinstance(result, ResponsesAPIResponse):
             raise ValueError(f"Expected ResponsesAPIResponse, got {type(result)}")
 
-        return _ADAPTER.translate_response(result)
+        return _ADAPTER.translate_response(result, tool_name_mapping=tool_name_mapping)
 
     @staticmethod
     def anthropic_messages_handler(
@@ -229,6 +235,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
             )
 
         # Sync path
+        tool_name_mapping = _create_tool_name_mapping(tools)
         responses_kwargs = _build_responses_kwargs(
             max_tokens=max_tokens,
             messages=messages,
@@ -262,4 +269,4 @@ class LiteLLMMessagesToResponsesAPIHandler:
         if not isinstance(result, ResponsesAPIResponse):
             raise ValueError(f"Expected ResponsesAPIResponse, got {type(result)}")
 
-        return _ADAPTER.translate_response(result)
+        return _ADAPTER.translate_response(result, tool_name_mapping=tool_name_mapping)

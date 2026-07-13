@@ -3,9 +3,11 @@ Tests for LiteLLMAnthropicToResponsesAPIAdapter
 (litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py)
 """
 
+import hashlib
 import json
 import os
 import sys
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
@@ -15,6 +17,9 @@ from litellm.constants import (
     DEFAULT_REASONING_EFFORT_HIGH_THINKING_BUDGET,
     DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET,
     DEFAULT_REASONING_EFFORT_MEDIUM_THINKING_BUDGET,
+)
+from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+    truncate_tool_name,
 )
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
     LiteLLMAnthropicToResponsesAPIAdapter,
@@ -99,17 +104,11 @@ class TestContextManagementConversion:
             }
         )
         kwargs = _ADAPTER.translate_request(req)
-        assert kwargs["context_management"] == [
-            {"type": "compaction", "compact_threshold": 100000}
-        ]
+        assert kwargs["context_management"] == [{"type": "compaction", "compact_threshold": 100000}]
 
     def test_translate_request_drops_anthropic_only_context_management(self):
         """context_management with only unknown edit types is omitted from kwargs."""
-        req = _make_request(
-            context_management={
-                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
-            }
-        )
+        req = _make_request(context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]})
         kwargs = _ADAPTER.translate_request(req)
         assert "context_management" not in kwargs
 
@@ -134,9 +133,7 @@ class TestOutputConfigStructuredOutput:
 
     def test_output_config_format_json_schema_converted(self):
         """output_config.format.json_schema is converted to OpenAI text.format."""
-        req = _make_request(
-            output_config={"format": {"type": "json_schema", "schema": self._SCHEMA}}
-        )
+        req = _make_request(output_config={"format": {"type": "json_schema", "schema": self._SCHEMA}})
         kwargs = _ADAPTER.translate_request(req)
         assert "text" in kwargs
         fmt = kwargs["text"]["format"]
@@ -153,9 +150,7 @@ class TestOutputConfigStructuredOutput:
 
     def test_output_format_still_works(self):
         """The original output_format field still takes precedence when present."""
-        req = _make_request(
-            output_format={"type": "json_schema", "schema": self._SCHEMA}
-        )
+        req = _make_request(output_format={"type": "json_schema", "schema": self._SCHEMA})
         kwargs = _ADAPTER.translate_request(req)
         assert "text" in kwargs
         assert kwargs["text"]["format"]["type"] == "json_schema"
@@ -250,9 +245,7 @@ class TestTranslateMessagesToResponsesInput:
         ]
         result = _translate_messages(messages)
         assert len(result) == 1
-        assert result[0]["content"] == [
-            {"type": "input_image", "image_url": "data:image/png;base64,abc123"}
-        ]
+        assert result[0]["content"] == [{"type": "input_image", "image_url": "data:image/png;base64,abc123"}]
 
     def test_user_url_image(self):
         """User message with URL image source becomes input_image with the URL."""
@@ -268,9 +261,7 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
         result = _translate_messages(messages)
-        assert result[0]["content"] == [
-            {"type": "input_image", "image_url": "https://example.com/img.jpg"}
-        ]
+        assert result[0]["content"] == [{"type": "input_image", "image_url": "https://example.com/img.jpg"}]
 
     def test_user_base64_image_empty_data_skipped(self):
         """Base64 image with empty data is skipped (no URL can be formed)."""
@@ -317,7 +308,6 @@ class TestTranslateMessagesToResponsesInput:
         ]
 
     def test_user_tool_result_list_content(self):
-        """tool_result with list of text blocks is joined into a single string."""
         messages = [
             {
                 "role": "user",
@@ -334,16 +324,49 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
         result = _translate_messages(messages)
-        assert result[0]["output"] == "Line 1\nLine 2"
+        assert result[0]["output"] == [
+            {"type": "input_text", "text": "Line 1"},
+            {"type": "input_text", "text": "Line 2"},
+        ]
+
+    def test_user_tool_result_preserves_text_and_image_content(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_media",
+                        "content": [
+                            {"type": "text", "text": "Screenshot"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "abc123",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        ]
+        result = _translate_messages(messages)
+        assert result[0]["output"] == [
+            {"type": "input_text", "text": "Screenshot"},
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,abc123",
+            },
+        ]
 
     def test_user_tool_result_null_content(self):
         """tool_result with null content becomes empty string output."""
         messages = [
             {
                 "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "call_null", "content": None}
-                ],
+                "content": [{"type": "tool_result", "tool_use_id": "call_null", "content": None}],
             }
         ]
         result = _translate_messages(messages)
@@ -370,9 +393,7 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
         result = _translate_messages(messages)
-        assert result[0]["content"] == [
-            {"type": "output_text", "text": "Here is the answer."}
-        ]
+        assert result[0]["content"] == [{"type": "output_text", "text": "Here is the answer."}]
 
     def test_assistant_tool_use_becomes_function_call(self):
         """Assistant tool_use block becomes a top-level function_call item."""
@@ -399,20 +420,86 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
 
+    def test_assistant_text_and_tool_blocks_preserve_order(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_order",
+                        "name": "lookup",
+                        "input": {"value": 1},
+                    },
+                    {"type": "text", "text": "After"},
+                ],
+            }
+        ]
+        result = _translate_messages(messages)
+        assert result == [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Before"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "toolu_order",
+                "name": "lookup",
+                "arguments": '{"value": 1}',
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "After"}],
+            },
+        ]
+
+    def test_user_text_and_tool_result_blocks_preserve_order(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_order",
+                        "content": "result",
+                    },
+                    {"type": "text", "text": "After"},
+                ],
+            }
+        ]
+        result = _translate_messages(messages)
+        assert result == [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Before"}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "toolu_order",
+                "output": "result",
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "After"}],
+            },
+        ]
+
     def test_assistant_thinking_block_becomes_output_text(self):
         """Assistant thinking block text is included as output_text."""
         messages = [
             {
                 "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "Let me reason step by step."}
-                ],
+                "content": [{"type": "thinking", "thinking": "Let me reason step by step."}],
             }
         ]
         result = _translate_messages(messages)
-        assert result[0]["content"] == [
-            {"type": "output_text", "text": "Let me reason step by step."}
-        ]
+        assert result[0]["content"] == [{"type": "output_text", "text": "Let me reason step by step."}]
 
     def test_assistant_empty_thinking_block_skipped(self):
         """Assistant thinking block with empty thinking text is skipped."""
@@ -587,24 +674,18 @@ class TestTranslateToolChoiceToResponsesAPI:
     """Anthropic tool_choice -> Responses API tool_choice."""
 
     def test_auto_maps_to_auto(self):
-        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "auto"}) == {
-            "type": "auto"
-        }
+        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "auto"}) == "auto"
 
     def test_any_maps_to_required(self):
-        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "any"}) == {
-            "type": "required"
-        }
+        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "any"}) == "required"
 
     def test_specific_tool_maps_to_function(self):
-        result = _ADAPTER.translate_tool_choice_to_responses_api(
-            {"type": "tool", "name": "get_weather"}
-        )
+        result = _ADAPTER.translate_tool_choice_to_responses_api({"type": "tool", "name": "get_weather"})
         assert result == {"type": "function", "name": "get_weather"}
 
-    def test_unknown_type_defaults_to_auto(self):
+    def test_none_maps_to_none(self):
         result = _ADAPTER.translate_tool_choice_to_responses_api({"type": "none"})
-        assert result == {"type": "auto"}
+        assert result == "none"
 
 
 # ---------------------------------------------------------------------------
@@ -616,17 +697,13 @@ class TestTranslateThinkingToReasoning:
     """Anthropic thinking param -> Responses API reasoning param."""
 
     def test_budget_high_effort(self):
-        result = _ADAPTER.translate_thinking_to_reasoning(
-            {"type": "enabled", "budget_tokens": 10000}
-        )
+        result = _ADAPTER.translate_thinking_to_reasoning({"type": "enabled", "budget_tokens": 10000})
         # Default (reasoning_auto_summary=False): only effort, no summary
         assert result == {"effort": "high"}
         assert result is not None and "summary" not in result
 
     def test_budget_above_threshold_high_effort(self):
-        result = _ADAPTER.translate_thinking_to_reasoning(
-            {"type": "enabled", "budget_tokens": 50000}
-        )
+        result = _ADAPTER.translate_thinking_to_reasoning({"type": "enabled", "budget_tokens": 50000})
         assert result is not None
         assert result["effort"] == "high"
         assert "summary" not in result
@@ -652,9 +729,7 @@ class TestTranslateThinkingToReasoning:
         assert result is not None and "summary" not in result
 
     def test_budget_minimal_effort(self):
-        result = _ADAPTER.translate_thinking_to_reasoning(
-            {"type": "enabled", "budget_tokens": 500}
-        )
+        result = _ADAPTER.translate_thinking_to_reasoning({"type": "enabled", "budget_tokens": 500})
         assert result == {"effort": "minimal"}
         assert result is not None and "summary" not in result
 
@@ -707,9 +782,7 @@ class TestTranslateThinkingToReasoning:
         original = litellm.reasoning_auto_summary
         try:
             litellm.reasoning_auto_summary = True
-            result = _ADAPTER.translate_thinking_to_reasoning(
-                {"type": "enabled", "budget_tokens": 10000}
-            )
+            result = _ADAPTER.translate_thinking_to_reasoning({"type": "enabled", "budget_tokens": 10000})
             assert result == {"effort": "high", "summary": "detailed"}
         finally:
             litellm.reasoning_auto_summary = original
@@ -773,10 +846,28 @@ class TestTranslateRequestBroaderCoverage:
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["instructions"] == "Only text matters."
 
+    def test_system_list_strips_anthropic_billing_header(self):
+        req = _make_request(
+            system=[
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.207;",
+                },
+                {"type": "text", "text": "Real instructions"},
+            ]
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["instructions"] == "Real instructions"
+
     def test_max_tokens_mapped_to_max_output_tokens(self):
         req = _make_request(max_tokens=512)
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["max_output_tokens"] == 512
+
+    def test_max_tokens_clamped_to_openai_minimum(self):
+        req = _make_request(max_tokens=1)
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["max_output_tokens"] == 16
 
     def test_temperature_passed_through(self):
         req = _make_request(temperature=0.7)
@@ -791,12 +882,18 @@ class TestTranslateRequestBroaderCoverage:
     def test_tools_translated(self):
         req = _make_request(
             tools=[
-                {"name": "calculator", "description": "Does math.", "input_schema": {}}
+                {
+                    "name": "calculator",
+                    "description": "Does math.",
+                    "input_schema": {},
+                    "strict": True,
+                }
             ]
         )
         kwargs = _ADAPTER.translate_request(req)
         assert len(kwargs["tools"]) == 1
         assert kwargs["tools"][0]["name"] == "calculator"
+        assert kwargs["tools"][0]["strict"] is True
 
     def test_tool_choice_translated(self):
         req = _make_request(
@@ -805,6 +902,39 @@ class TestTranslateRequestBroaderCoverage:
         )
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["tool_choice"] == {"type": "function", "name": "do_thing"}
+
+    def test_long_tool_names_use_shared_hash_mapping(self):
+        long_name = "tool_" + "x" * 80
+        truncated_name = truncate_tool_name(long_name)
+        req = _make_request(
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_long",
+                            "name": long_name,
+                            "input": {},
+                        }
+                    ],
+                }
+            ],
+            tools=[{"name": long_name}],
+            tool_choice={"type": "tool", "name": long_name},
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["input"][0]["name"] == truncated_name
+        assert kwargs["tools"][0]["name"] == truncated_name
+        assert kwargs["tool_choice"]["name"] == truncated_name
+
+    def test_disable_parallel_tool_use_translated(self):
+        req = _make_request(
+            tools=[{"name": "do_thing"}],
+            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["parallel_tool_calls"] is False
 
     def test_thinking_translated_to_reasoning(self):
         req = _make_request(thinking={"type": "enabled", "budget_tokens": 12000})
@@ -822,12 +952,16 @@ class TestTranslateRequestBroaderCoverage:
         req = _make_request(metadata={"user_id": "user-42"})
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["user"] == "user-42"
+        assert kwargs["prompt_cache_key"] == hashlib.sha256(b"user-42").hexdigest()
 
     def test_metadata_user_id_truncated_to_64_chars(self):
-        long_id = "x" * 100
-        req = _make_request(metadata={"user_id": long_id})
-        kwargs = _ADAPTER.translate_request(req)
-        assert len(kwargs["user"]) == 64
+        first_id = "x" * 100
+        second_id = "x" * 99 + "y"
+        first_kwargs = _ADAPTER.translate_request(_make_request(metadata={"user_id": first_id}))
+        second_kwargs = _ADAPTER.translate_request(_make_request(metadata={"user_id": second_id}))
+        assert first_kwargs["user"] == second_kwargs["user"] == "x" * 64
+        assert first_kwargs["prompt_cache_key"] == hashlib.sha256(first_id.encode()).hexdigest()
+        assert first_kwargs["prompt_cache_key"] != second_kwargs["prompt_cache_key"]
 
     def test_no_optional_fields_does_not_add_spurious_keys(self):
         req = _make_request()
@@ -842,6 +976,8 @@ class TestTranslateRequestBroaderCoverage:
             "text",
             "context_management",
             "user",
+            "prompt_cache_key",
+            "parallel_tool_calls",
         ):
             assert key not in kwargs, f"unexpected key: {key}"
 
@@ -870,6 +1006,7 @@ def _make_mock_response(
     resp.status = status
     resp.output = output
     resp.usage = usage
+    resp.usage.input_tokens_details = None
     return resp
 
 
@@ -929,9 +1066,7 @@ class TestTranslateResponse:
 
     def test_multiple_text_parts(self):
         """Multiple output_text parts become multiple text content blocks."""
-        response = _make_mock_response(
-            output=[_make_output_message(["Part 1", "Part 2"])]
-        )
+        response = _make_mock_response(output=[_make_output_message(["Part 1", "Part 2"])])
         result: Any = _ADAPTER.translate_response(response)
         assert len(result["content"]) == 2
         assert result["content"][0]["text"] == "Part 1"
@@ -955,6 +1090,17 @@ class TestTranslateResponse:
         response = _make_mock_response(output=[fc])
         result: Any = _ADAPTER.translate_response(response)
         assert result["stop_reason"] == "tool_use"
+
+    def test_function_call_restores_long_tool_name(self):
+        original_name = "tool_" + "x" * 80
+        truncated_name = truncate_tool_name(original_name)
+        fc = _make_function_call_item("call_1", truncated_name, "{}")
+        response = _make_mock_response(output=[fc])
+        result: Any = _ADAPTER.translate_response(
+            response,
+            tool_name_mapping={truncated_name: original_name},
+        )
+        assert result["content"][0]["name"] == original_name
 
     def test_text_only_stop_reason_end_turn(self):
         """Text-only response has stop_reason 'end_turn'."""
@@ -997,6 +1143,34 @@ class TestTranslateResponse:
         result: Any = _ADAPTER.translate_response(response)
         assert result["usage"]["input_tokens"] == 200
         assert result["usage"]["output_tokens"] == 75
+
+    def test_usage_splits_cache_tokens_from_object_details(self):
+        response = _make_mock_response(output=[], input_tokens=100, output_tokens=25)
+        response.usage.input_tokens_details = SimpleNamespace(
+            cached_tokens=40,
+            cache_write_tokens=5,
+        )
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["usage"] == {
+            "input_tokens": 55,
+            "output_tokens": 25,
+            "cache_creation_input_tokens": 5,
+            "cache_read_input_tokens": 40,
+        }
+
+    def test_usage_splits_cache_tokens_from_dict_details(self):
+        response = _make_mock_response(output=[], input_tokens=100, output_tokens=25)
+        response.usage.input_tokens_details = {
+            "cached_tokens": 40,
+            "cache_creation_tokens": 5,
+        }
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["usage"] == {
+            "input_tokens": 55,
+            "output_tokens": 25,
+            "cache_creation_input_tokens": 5,
+            "cache_read_input_tokens": 40,
+        }
 
     def test_model_and_id_preserved(self):
         """Model and response ID from the Responses API are forwarded."""

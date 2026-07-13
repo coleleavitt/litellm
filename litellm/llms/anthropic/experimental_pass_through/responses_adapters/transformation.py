@@ -5,6 +5,7 @@ This module owns all format conversions for the direct v1/messages -> Responses 
 path used for OpenAI and Azure models.
 """
 
+import hashlib
 import json
 from typing import Any, Dict, List, Optional, Union, cast
 
@@ -13,6 +14,9 @@ from litellm.litellm_core_utils.reasoning_effort_utils import (
 )
 from litellm.llms.anthropic.experimental_pass_through.utils import (
     is_reasoning_auto_summary_enabled,
+)
+from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+    truncate_tool_name,
 )
 from litellm.types.llms.anthropic import (
     AllAnthropicToolsValues,
@@ -32,6 +36,32 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 from litellm.types.llms.openai import ResponsesAPIResponse
 
 
+OPENAI_MIN_RESPONSE_OUTPUT_TOKENS = 16
+
+
+def _token_count(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _is_billing_header_block(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    block = cast(Dict[str, object], value)
+    text = block.get("text")
+    return block.get("type") == "text" and isinstance(text, str) and text.startswith("x-anthropic-billing-header:")
+
+
+def _filter_billing_headers_from_system(system: object) -> Optional[Union[str, List[object]]]:
+    if isinstance(system, str):
+        return None if system.startswith("x-anthropic-billing-header:") else system
+    if not isinstance(system, list):
+        return None
+    blocks = cast(List[object], system)
+    return [block for block in blocks if not _is_billing_header_block(block)]
+
+
 class LiteLLMAnthropicToResponsesAPIAdapter:
     """
     Converts Anthropic /v1/messages requests to OpenAI Responses API format and
@@ -43,15 +73,17 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _translate_anthropic_image_source_to_url(source: dict) -> Optional[str]:
+    def _translate_anthropic_image_source_to_url(source: Dict[str, object]) -> Optional[str]:
         """Convert Anthropic image source to a URL string."""
         source_type = source.get("type")
         if source_type == "base64":
-            media_type = source.get("media_type", "image/jpeg")
-            data = source.get("data", "")
-            return f"data:{media_type};base64,{data}" if data else None
+            media_type_value = source.get("media_type", "image/jpeg")
+            media_type = media_type_value if isinstance(media_type_value, str) else "image/jpeg"
+            data = source.get("data")
+            return f"data:{media_type};base64,{data}" if isinstance(data, str) and data else None
         elif source_type == "url":
-            return source.get("url")
+            url = source.get("url")
+            return url if isinstance(url, str) else None
         return None
 
     def translate_messages_to_responses_input(
@@ -97,29 +129,53 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         if btype == "text":
                             user_parts.append({"type": "input_text", "text": block.get("text", "")})
                         elif btype == "image":
-                            url = self._translate_anthropic_image_source_to_url(cast(dict, block.get("source", {})))
+                            url = self._translate_anthropic_image_source_to_url(
+                                cast(Dict[str, object], block.get("source", {}))
+                            )
                             if url:
                                 user_parts.append({"type": "input_image", "image_url": url})
                         elif btype == "tool_result":
+                            if user_parts:
+                                input_items.append(
+                                    {
+                                        "type": "message",
+                                        "role": "user",
+                                        "content": user_parts,
+                                    }
+                                )
+                                user_parts = []
                             tool_use_id = block.get("tool_use_id", "")
                             inner = block.get("content")
                             if inner is None:
-                                output_text = ""
+                                output: object = ""
                             elif isinstance(inner, str):
-                                output_text = inner
+                                output = inner
                             elif isinstance(inner, list):
-                                parts = [
-                                    c.get("text", "") for c in inner if isinstance(c, dict) and c.get("type") == "text"
-                                ]
-                                output_text = "\n".join(parts)
+                                output_parts: List[Dict[str, object]] = []
+                                for part in inner:
+                                    if not isinstance(part, dict):
+                                        continue
+                                    part_dict = cast(Dict[str, object], part)
+                                    if part_dict.get("type") == "text":
+                                        text = part_dict.get("text")
+                                        output_parts.append(
+                                            {"type": "input_text", "text": text if isinstance(text, str) else ""}
+                                        )
+                                    elif part_dict.get("type") == "image":
+                                        url = self._translate_anthropic_image_source_to_url(
+                                            cast(Dict[str, object], part_dict.get("source", {}))
+                                        )
+                                        if url:
+                                            output_parts.append({"type": "input_image", "image_url": url})
+                                output = output_parts if output_parts else ""
                             else:
-                                output_text = str(inner)
+                                output = str(inner)
                             # tool_result is a top-level item, not inside the message
                             input_items.append(
                                 {
                                     "type": "function_call_output",
                                     "call_id": tool_use_id,
-                                    "output": output_text,
+                                    "output": output,
                                 }
                             )
                     if user_parts:
@@ -149,12 +205,21 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         if btype == "text":
                             asst_parts.append({"type": "output_text", "text": block.get("text", "")})
                         elif btype == "tool_use":
+                            if asst_parts:
+                                input_items.append(
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": asst_parts,
+                                    }
+                                )
+                                asst_parts = []
                             # tool_use becomes a top-level function_call item
                             input_items.append(
                                 {
                                     "type": "function_call",
                                     "call_id": block.get("id", ""),
-                                    "name": block.get("name", ""),
+                                    "name": truncate_tool_name(block.get("name", "")),
                                     "arguments": json.dumps(block.get("input", {})),
                                 }
                             )
@@ -182,30 +247,35 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         for tool in tools:
             tool_dict = cast(Dict[str, Any], tool)
             tool_type = tool_dict.get("type", "")
-            tool_name = tool_dict.get("name", "")
+            tool_name_value = tool_dict.get("name", "")
+            tool_name = tool_name_value if isinstance(tool_name_value, str) else ""
             # web_search tool
             if (isinstance(tool_type, str) and tool_type.startswith("web_search")) or tool_name == "web_search":
                 result.append({"type": "web_search_preview"})
                 continue
-            func_tool: Dict[str, Any] = {"type": "function", "name": tool_name}
+            func_tool: Dict[str, Any] = {"type": "function", "name": truncate_tool_name(tool_name)}
             if "description" in tool_dict:
                 func_tool["description"] = tool_dict["description"]
             if "input_schema" in tool_dict:
                 func_tool["parameters"] = tool_dict["input_schema"]
+            if "strict" in tool_dict:
+                func_tool["strict"] = tool_dict["strict"]
             result.append(func_tool)
         return result
 
     @staticmethod
     def translate_tool_choice_to_responses_api(
         tool_choice: AnthropicMessagesToolChoice,
-    ) -> Dict[str, Any]:
+    ) -> Union[str, Dict[str, str]]:
         """Convert Anthropic tool_choice to Responses API tool_choice."""
         tc_type = tool_choice.get("type")
         if tc_type == "any":
-            return {"type": "required"}
+            return "required"
         elif tc_type == "tool":
-            return {"type": "function", "name": tool_choice.get("name", "")}
-        return {"type": "auto"}
+            return {"type": "function", "name": truncate_tool_name(tool_choice.get("name", ""))}
+        elif tc_type == "none":
+            return "none"
+        return "auto"
 
     @staticmethod
     def translate_context_management_to_responses_api(
@@ -300,7 +370,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         }
 
         # system -> instructions
-        system = anthropic_request.get("system")
+        system = _filter_billing_headers_from_system(anthropic_request.get("system"))
         if system:
             if isinstance(system, str):
                 responses_kwargs["instructions"] = system
@@ -310,8 +380,8 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
         # max_tokens -> max_output_tokens
         max_tokens = anthropic_request.get("max_tokens")
-        if max_tokens:
-            responses_kwargs["max_output_tokens"] = max_tokens
+        if max_tokens is not None:
+            responses_kwargs["max_output_tokens"] = max(OPENAI_MIN_RESPONSE_OUTPUT_TOKENS, max_tokens)
 
         # temperature / top_p passed through
         if "temperature" in anthropic_request:
@@ -332,6 +402,8 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             responses_kwargs["tool_choice"] = self.translate_tool_choice_to_responses_api(
                 cast(AnthropicMessagesToolChoice, tool_choice)
             )
+            if "disable_parallel_tool_use" in tool_choice:
+                responses_kwargs["parallel_tool_calls"] = not bool(tool_choice["disable_parallel_tool_use"])
 
         # thinking -> reasoning
         thinking = anthropic_request.get("thinking")
@@ -373,7 +445,9 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         # metadata user_id -> user
         metadata = anthropic_request.get("metadata")
         if isinstance(metadata, dict) and "user_id" in metadata:
-            responses_kwargs["user"] = str(metadata["user_id"])[:64]
+            user_id = str(metadata["user_id"])
+            responses_kwargs["user"] = user_id[:64]
+            responses_kwargs["prompt_cache_key"] = hashlib.sha256(user_id.encode()).hexdigest()
 
         return responses_kwargs
 
@@ -384,6 +458,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
     def translate_response(
         self,
         response: ResponsesAPIResponse,
+        tool_name_mapping: Optional[Dict[str, str]] = None,
     ) -> AnthropicMessagesResponse:
         """
         Translate an OpenAI ResponsesAPIResponse to AnthropicMessagesResponse.
@@ -428,7 +503,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                     AnthropicResponseContentBlockToolUse(
                         type="tool_use",
                         id=item.call_id or item.id or "",
-                        name=item.name,
+                        name=(tool_name_mapping or {}).get(item.name, item.name),
                         input=input_data,
                     ).model_dump()
                 )
@@ -447,11 +522,13 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         input_data = json.loads(item.get("arguments", "{}"))
                     except (json.JSONDecodeError, TypeError):
                         input_data = {}
+                    item_name_value = item.get("name", "")
+                    item_name = item_name_value if isinstance(item_name_value, str) else ""
                     content.append(
                         AnthropicResponseContentBlockToolUse(
                             type="tool_use",
                             id=item.get("call_id") or item.get("id", ""),
-                            name=item.get("name", ""),
+                            name=(tool_name_mapping or {}).get(item_name, item_name),
                             input=input_data,
                         ).model_dump()
                     )
@@ -463,12 +540,29 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
         # usage
         raw_usage: Optional[ResponseAPIUsage] = response.usage
-        input_tokens = int(getattr(raw_usage, "input_tokens", 0) or 0)
+        total_input_tokens = int(getattr(raw_usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(raw_usage, "output_tokens", 0) or 0)
+        input_token_details = getattr(raw_usage, "input_tokens_details", None)
+        if isinstance(input_token_details, dict):
+            details = cast(Dict[str, object], input_token_details)
+            cache_read_input_tokens = _token_count(details.get("cached_tokens"))
+            cache_creation_input_tokens = _token_count(
+                details.get("cache_write_tokens", 0) or details.get("cache_creation_tokens", 0)
+            )
+        else:
+            cache_read_value: object = getattr(input_token_details, "cached_tokens", 0)
+            cache_creation_value: object = getattr(input_token_details, "cache_write_tokens", 0) or getattr(
+                input_token_details, "cache_creation_tokens", 0
+            )
+            cache_read_input_tokens = _token_count(cache_read_value)
+            cache_creation_input_tokens = _token_count(cache_creation_value)
+        input_tokens = max(0, total_input_tokens - cache_read_input_tokens - cache_creation_input_tokens)
 
         anthropic_usage = AnthropicUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
         )
 
         return AnthropicMessagesResponse(
