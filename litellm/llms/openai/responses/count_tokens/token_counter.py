@@ -60,11 +60,11 @@ class OpenAITokenCounter(BaseTokenCounter):
         api_base = litellm_params.get("api_base")
 
         # Convert chat messages to Responses API input format
-        input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(messages)
-
-        # Use system param if instructions not extracted from messages
-        if instructions is None and system is not None:
-            instructions = system if isinstance(system, str) else str(system)
+        input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(
+            messages,
+            tools=tools,
+            system=system,
+        )
 
         # If no input items were produced (e.g., system-only messages), fall back to local counting
         if not input_items:

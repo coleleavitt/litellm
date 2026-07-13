@@ -1,9 +1,10 @@
 import os
 import sys
 
-sys.path.insert(
-    0, os.path.abspath("../../../../..")
-)  # Adds the parent directory to the system path
+from openai.types.responses.input_token_count_params import InputTokenCountParams
+from pydantic import TypeAdapter
+
+sys.path.insert(0, os.path.abspath("../../../../.."))  # Adds the parent directory to the system path
 from litellm.llms.openai.responses.count_tokens.transformation import (
     OpenAICountTokensConfig,
 )
@@ -105,9 +106,7 @@ def test_messages_to_responses_input_basic():
         {"role": "user", "content": "How are you?"},
     ]
 
-    input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(
-        messages
-    )
+    input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(messages)
 
     assert len(input_items) == 3
     assert input_items[0] == {"role": "user", "content": "Hello"}
@@ -123,9 +122,7 @@ def test_messages_to_responses_input_with_system():
         {"role": "user", "content": "Hello"},
     ]
 
-    input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(
-        messages
-    )
+    input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(messages)
 
     assert len(input_items) == 1
     assert input_items[0] == {"role": "user", "content": "Hello"}
@@ -139,9 +136,7 @@ def test_messages_to_responses_input_with_developer():
         {"role": "user", "content": "Hello"},
     ]
 
-    input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(
-        messages
-    )
+    input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(messages)
 
     assert len(input_items) == 1
     assert instructions == "Be concise."
@@ -154,9 +149,7 @@ def test_messages_to_responses_input_with_tool():
         {"role": "tool", "content": "72°F", "tool_call_id": "call_123"},
     ]
 
-    input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(
-        messages
-    )
+    input_items, instructions = OpenAICountTokensConfig.messages_to_responses_input(messages)
 
     assert len(input_items) == 2
     assert input_items[1] == {
@@ -164,6 +157,148 @@ def test_messages_to_responses_input_with_tool():
         "call_id": "call_123",
         "output": "72°F",
     }
+
+
+def test_anthropic_history_maps_to_responses_count_request_without_reordering():
+    config = OpenAICountTokensConfig()
+    system = [
+        {
+            "type": "text",
+            "text": "Count accurately.",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": "Keep tool history."},
+    ]
+    tools = [
+        {
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect this image."},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aGVsbG8=",
+                    },
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "I should read the file.",
+                    "signature": "signature",
+                },
+                {"type": "text", "text": "Reading it now."},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "read_file",
+                    "input": {"path": "/tmp/example"},
+                },
+                {"type": "text", "text": "The call was queued."},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_123",
+                    "content": [{"type": "text", "text": "file contents"}],
+                },
+                {"type": "text", "text": "Continue."},
+            ],
+        },
+    ]
+
+    input_items, instructions = config.messages_to_responses_input(
+        messages,
+        tools=tools,
+        system=system,
+    )
+    result = config.transform_request_to_count_tokens(
+        model="gpt-5.6-sol",
+        input=input_items,
+        tools=tools,
+        instructions=instructions,
+    )
+
+    assert result == {
+        "model": "gpt-5.6-sol",
+        "instructions": "Count accurately.\nKeep tool history.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }
+        ],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Inspect this image."},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,aGVsbG8=",
+                        "detail": "auto",
+                    },
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "input_text", "text": "I should read the file."},
+                    {"type": "input_text", "text": "Reading it now."},
+                ],
+            },
+            {
+                "type": "function_call",
+                "call_id": "toolu_123",
+                "name": "read_file",
+                "arguments": '{"path": "/tmp/example"}',
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "input_text", "text": "The call was queued."}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "toolu_123",
+                "output": "file contents",
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue."}],
+            },
+        ],
+    }
+    TypeAdapter(InputTokenCountParams).validate_python(result)
 
 
 def test_validate_request_valid():
@@ -195,10 +330,7 @@ def test_validate_request_missing_input():
 def test_get_endpoint_default():
     """Test default endpoint URL."""
     config = OpenAICountTokensConfig()
-    assert (
-        config.get_openai_count_tokens_endpoint()
-        == "https://api.openai.com/v1/responses/input_tokens"
-    )
+    assert config.get_openai_count_tokens_endpoint() == "https://api.openai.com/v1/responses/input_tokens"
 
 
 def test_get_endpoint_custom_base():
