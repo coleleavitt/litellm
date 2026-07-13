@@ -986,13 +986,23 @@ class ResponseAPILoggingUtils:
         prompt_tokens_details: Optional[PromptTokensDetailsWrapper] = None
         if response_api_usage.input_tokens_details:
             if isinstance(response_api_usage.input_tokens_details, dict):
-                prompt_tokens_details = PromptTokensDetailsWrapper(**response_api_usage.input_tokens_details)
+                input_details = dict(response_api_usage.input_tokens_details)
+                input_details["cache_creation_tokens"] = input_details.get(
+                    "cache_creation_tokens"
+                ) or input_details.get("cache_write_tokens")
+                prompt_tokens_details = PromptTokensDetailsWrapper(**input_details)
             else:
                 prompt_tokens_details = PromptTokensDetailsWrapper(
                     cached_tokens=getattr(response_api_usage.input_tokens_details, "cached_tokens", None),
                     audio_tokens=getattr(response_api_usage.input_tokens_details, "audio_tokens", None),
                     text_tokens=getattr(response_api_usage.input_tokens_details, "text_tokens", None),
                     image_tokens=getattr(response_api_usage.input_tokens_details, "image_tokens", None),
+                    cache_creation_tokens=getattr(
+                        response_api_usage.input_tokens_details,
+                        "cache_creation_tokens",
+                        None,
+                    )
+                    or getattr(response_api_usage.input_tokens_details, "cache_write_tokens", None),
                 )
         completion_tokens_details: Optional[CompletionTokensDetailsWrapper] = None
         output_tokens_details = getattr(response_api_usage, "output_tokens_details", None)
