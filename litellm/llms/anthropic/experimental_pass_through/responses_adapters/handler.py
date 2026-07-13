@@ -51,6 +51,7 @@ def _build_responses_kwargs(
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
     output_format: Optional[Dict] = None,
+    mcp_servers: Optional[List[Dict]] = None,
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -59,6 +60,8 @@ def _build_responses_kwargs(
     ``stop_sequences`` and ``top_k`` are not part of the Responses API. ``stop_sequences``
     is emulated in the response/stream layer (which is why it is passed through to the
     adapter separately), and ``top_k`` has no Responses equivalent so it is dropped.
+    ``mcp_servers`` is translated by the adapter into Responses ``mcp`` tools; taking it
+    as an explicit param also stops it from leaking into ``litellm.aresponses()`` kwargs.
     """
     # Build a typed AnthropicMessagesRequest for the adapter
     request_data: Dict[str, Any] = {
@@ -66,6 +69,8 @@ def _build_responses_kwargs(
         "messages": messages,
         "max_tokens": max_tokens,
     }
+    if mcp_servers:
+        request_data["mcp_servers"] = mcp_servers
     if context_management:
         request_data["context_management"] = context_management
     if output_config:
@@ -156,6 +161,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         output_format: Optional[Dict] = None,
+        mcp_servers: Optional[List[Dict]] = None,
         **kwargs,
     ) -> Union[AnthropicMessagesResponse, AsyncIterator]:
         tool_name_mapping = _create_tool_name_mapping(tools)
@@ -176,6 +182,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
             top_k=top_k,
             top_p=top_p,
             output_format=output_format,
+            mcp_servers=mcp_servers,
             extra_kwargs=kwargs,
         )
 
@@ -214,6 +221,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         output_format: Optional[Dict] = None,
+        mcp_servers: Optional[List[Dict]] = None,
         _is_async: bool = False,
         **kwargs,
     ) -> Union[
@@ -239,6 +247,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
                 top_k=top_k,
                 top_p=top_p,
                 output_format=output_format,
+                mcp_servers=mcp_servers,
                 **kwargs,
             )
 
@@ -261,6 +270,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
             top_k=top_k,
             top_p=top_p,
             output_format=output_format,
+            mcp_servers=mcp_servers,
             extra_kwargs=kwargs,
         )
 

@@ -1473,3 +1473,169 @@ class TestTranslateResponse:
         response.incomplete_details = SimpleNamespace(reason="model_context_window_exceeded")
         result: Any = _ADAPTER.translate_response(response)
         assert result["stop_reason"] == "model_context_window_exceeded"
+
+
+class TestToolAndMcpParity:
+    """Request/response parity for tools, hosted tools, MCP, and tool errors."""
+
+    def test_mcp_servers_translated_to_responses_mcp_tools(self):
+        from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+            translate_mcp_servers_to_responses_api,
+        )
+
+        result = translate_mcp_servers_to_responses_api(
+            [
+                {
+                    "type": "url",
+                    "url": "https://mcp.example.com",
+                    "name": "weather",
+                    "authorization_token": "tok",
+                    "tool_configuration": {"allowed_tools": ["get_forecast"]},
+                }
+            ]
+        )
+        assert result == [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": "https://mcp.example.com",
+                "require_approval": "never",
+                "headers": {"Authorization": "Bearer tok"},
+                "allowed_tools": ["get_forecast"],
+            }
+        ]
+
+    def test_mcp_servers_appended_to_tools_in_request(self):
+        req: Any = AnthropicMessagesRequest(
+            model="gpt-5.6",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            tools=[{"name": "Bash", "input_schema": {"type": "object", "properties": {}}}],
+            mcp_servers=[{"type": "url", "url": "https://m", "name": "srv"}],
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        types = [t["type"] for t in kwargs["tools"]]
+        assert "function" in types and "mcp" in types
+
+    def test_mcp_servers_missing_url_or_name_skipped(self):
+        from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+            translate_mcp_servers_to_responses_api,
+        )
+
+        assert translate_mcp_servers_to_responses_api([{"type": "url", "name": "no_url"}]) == []
+
+    def test_code_execution_maps_to_code_interpreter(self):
+        tools = _ADAPTER.translate_tools_to_responses_api(
+            [{"type": "code_execution_20250522", "name": "code_execution"}]
+        )
+        assert tools == [{"type": "code_interpreter", "container": {"type": "auto"}}]
+
+    def test_unsupported_hosted_tool_is_skipped(self):
+        tools = _ADAPTER.translate_tools_to_responses_api(
+            [
+                {"type": "bash_20250124", "name": "bash"},
+                {"type": "text_editor_20250124", "name": "str_replace_editor"},
+                {"type": "memory_20250818", "name": "memory"},
+            ]
+        )
+        assert tools == []
+
+    def test_tool_schema_sanitized(self):
+        tools = _ADAPTER.translate_tools_to_responses_api(
+            [
+                {
+                    "name": "t",
+                    "input_schema": {"$schema": "http://x", "type": "object", "properties": {"a": {"type": "string"}}},
+                }
+            ]
+        )
+        assert tools[0]["parameters"] == {"type": "object", "properties": {"a": {"type": "string"}}}
+
+    def test_tool_without_schema_omits_parameters(self):
+        tools = _ADAPTER.translate_tools_to_responses_api([{"name": "noargs"}])
+        assert "parameters" not in tools[0]
+
+    def test_sanitize_tool_parameters_coerces_non_object(self):
+        from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+            sanitize_tool_parameters,
+        )
+
+        assert sanitize_tool_parameters(None) == {"type": "object", "properties": {}}
+        assert sanitize_tool_parameters({"type": "string"}) == {"type": "object", "properties": {}}
+
+    def test_tool_result_is_error_wrapped(self):
+        items = _translate_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "boom", "is_error": True}],
+                }
+            ]
+        )
+        assert items == [
+            {"type": "function_call_output", "call_id": "t1", "output": "<tool_use_error>boom</tool_use_error>"}
+        ]
+
+    def test_tool_result_is_error_wrapped_in_list_content(self):
+        items = _translate_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": [{"type": "text", "text": "bad"}],
+                            "is_error": True,
+                        }
+                    ],
+                }
+            ]
+        )
+        assert items[0]["output"] == [{"type": "input_text", "text": "<tool_use_error>bad</tool_use_error>"}]
+
+    def test_tool_result_without_error_unchanged(self):
+        items = _translate_messages(
+            [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}]
+        )
+        assert items == [{"type": "function_call_output", "call_id": "t1", "output": "ok"}]
+
+    def test_mcp_call_item_becomes_mcp_tool_blocks(self):
+        response = _make_mock_response(
+            output=[
+                {
+                    "type": "mcp_call",
+                    "id": "c1",
+                    "name": "get_forecast",
+                    "server_label": "weather",
+                    "arguments": '{"city": "NYC"}',
+                    "output": "sunny",
+                }
+            ]
+        )
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["content"][0] == {
+            "type": "mcp_tool_use",
+            "id": "c1",
+            "name": "get_forecast",
+            "server_name": "weather",
+            "input": {"city": "NYC"},
+        }
+        assert result["content"][1] == {
+            "type": "mcp_tool_result",
+            "tool_use_id": "c1",
+            "is_error": False,
+            "content": [{"type": "text", "text": "sunny"}],
+        }
+        # server-executed tool: turn is not a client tool_use stop
+        assert result["stop_reason"] == "end_turn"
+
+    def test_mcp_call_error_sets_is_error(self):
+        response = _make_mock_response(
+            output=[
+                {"type": "mcp_call", "id": "c1", "name": "x", "server_label": "s", "arguments": "{}", "error": "denied"}
+            ]
+        )
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["content"][1]["is_error"] is True
+        assert result["content"][1]["content"] == [{"type": "text", "text": "denied"}]

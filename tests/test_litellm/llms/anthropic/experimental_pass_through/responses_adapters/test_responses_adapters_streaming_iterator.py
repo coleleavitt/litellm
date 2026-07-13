@@ -556,3 +556,36 @@ def test_model_context_window_exceeded_streaming_stop_reason():
     chunks = _process_all(events)
     message_delta = next(c for c in chunks if c["type"] == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "model_context_window_exceeded"
+
+
+def test_mcp_call_streams_as_mcp_tool_blocks():
+    events = [
+        {"type": "response.created"},
+        {"type": "response.output_item.added", "item": {"type": "mcp_call", "id": "c1"}},
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "mcp_call",
+                "id": "c1",
+                "name": "get_forecast",
+                "server_label": "weather",
+                "arguments": '{"city": "NYC"}',
+                "output": "sunny",
+            },
+        },
+        _completed_event(),
+    ]
+    chunks = _process_all(events)
+    starts = [c for c in chunks if c["type"] == "content_block_start"]
+    assert [s["content_block"]["type"] for s in starts] == ["mcp_tool_use", "mcp_tool_result"]
+    assert starts[0]["content_block"]["input"] == {"city": "NYC"}
+    assert starts[1]["content_block"]["content"] == [{"type": "text", "text": "sunny"}]
+    # each block is opened and closed
+    assert [c["type"] for c in chunks if c["type"] in ("content_block_start", "content_block_stop")] == [
+        "content_block_start",
+        "content_block_stop",
+        "content_block_start",
+        "content_block_stop",
+    ]
+    message_delta = next(c for c in chunks if c["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "end_turn"

@@ -9,6 +9,7 @@ from pydantic import TypeAdapter
 from litellm._uuid import uuid
 
 from .transformation import (
+    build_mcp_tool_blocks,
     encode_reasoning_item_signature,
     find_earliest_stop_sequence,
     map_service_tier,
@@ -101,6 +102,20 @@ class AnthropicResponsesStreamWrapper:
         if self._held_content_block_stop is not None:
             self._chunk_queue.append(self._held_content_block_stop)
             self._held_content_block_stop = None
+
+    def _emit_mcp_call_blocks(self, item: object) -> None:
+        """Emit a server-executed MCP call as atomic mcp_tool_use + mcp_tool_result blocks."""
+        self._flush_held_content_block_stop()
+        for block in build_mcp_tool_blocks(item):
+            block_idx = self._next_block_index()
+            self._chunk_queue.append(
+                {
+                    "type": "content_block_start",
+                    "index": block_idx,
+                    "content_block": block,
+                }
+            )
+            self._chunk_queue.append({"type": "content_block_stop", "index": block_idx})
 
     def _queue_text_delta(self, block_idx: int, text: str) -> None:
         if text:
@@ -331,6 +346,10 @@ class AnthropicResponsesStreamWrapper:
                 getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else None) if item else None
             )
             item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
+            if item_type == "mcp_call":
+                # Server-executed MCP call arrives complete: emit its blocks atomically.
+                self._emit_mcp_call_blocks(item)
+                return
             if item_id:
                 block_idx = self._item_id_to_block_index.pop(item_id, None)
                 if block_idx is None:

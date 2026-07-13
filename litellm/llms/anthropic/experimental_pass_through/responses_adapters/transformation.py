@@ -268,6 +268,164 @@ def apply_stop_sequences_to_content(
     return None
 
 
+_TOOL_USE_ERROR_OPEN = "<tool_use_error>"
+_TOOL_USE_ERROR_CLOSE = "</tool_use_error>"
+
+
+def _wrap_tool_error(output: object) -> object:
+    """Wrap an errored tool_result payload in Claude Code's <tool_use_error> marker."""
+    if isinstance(output, str):
+        return f"{_TOOL_USE_ERROR_OPEN}{output}{_TOOL_USE_ERROR_CLOSE}"
+    if isinstance(output, list):
+        parts = cast(List[Dict[str, object]], output)  # cast-ok: built as input_text/input_image parts above
+        wrapped_any = False
+        for part in parts:
+            if isinstance(part, dict) and part.get("type") == "input_text":
+                text = part.get("text")
+                part["text"] = f"{_TOOL_USE_ERROR_OPEN}{text if isinstance(text, str) else ''}{_TOOL_USE_ERROR_CLOSE}"
+                wrapped_any = True
+        if not wrapped_any:
+            parts.insert(0, {"type": "input_text", "text": f"{_TOOL_USE_ERROR_OPEN}{_TOOL_USE_ERROR_CLOSE}"})
+        return parts
+    return output
+
+
+# JSON Schema keywords the OpenAI Responses API rejects on function parameters.
+_UNSUPPORTED_SCHEMA_ROOT_KEYS = ("$schema", "$id", "$anchor", "$comment", "id")
+
+
+def sanitize_tool_parameters(input_schema: object) -> Dict[str, Any]:
+    """Coerce an Anthropic input_schema into a Responses-compatible parameters object.
+
+    Guarantees an object-typed schema and strips root keywords the Responses API
+    rejects, so a nonconforming tool degrades instead of 400-ing the whole request.
+    """
+    if not isinstance(input_schema, dict):
+        return {"type": "object", "properties": {}}
+    schema = {k: v for k, v in cast(Dict[str, Any], input_schema).items() if k not in _UNSUPPORTED_SCHEMA_ROOT_KEYS}
+    if schema.get("type") != "object":
+        schema["type"] = "object"
+    if not isinstance(schema.get("properties"), dict):
+        schema["properties"] = {}
+    return schema
+
+
+# Anthropic hosted tools with no Responses equivalent (web_search / code_execution
+# are handled explicitly and are not listed here).
+_UNSUPPORTED_HOSTED_TOOL_NAMES = frozenset(
+    {"bash", "text_editor", "computer", "memory", "web_fetch", "tool_search_tool"}
+)
+_UNSUPPORTED_HOSTED_TOOL_PREFIXES = (
+    "bash_",
+    "text_editor_",
+    "str_replace",
+    "computer_",
+    "memory_",
+    "web_fetch",
+    "tool_search",
+)
+
+
+def _is_unsupported_hosted_tool(tool_type: str, tool_name: str, tool_dict: Dict[str, Any]) -> bool:
+    """A hosted tool is one declared by ``type`` (versioned) with no ``input_schema``."""
+    if "input_schema" in tool_dict:
+        return False
+    if tool_name in _UNSUPPORTED_HOSTED_TOOL_NAMES:
+        return True
+    return any(tool_type.startswith(prefix) for prefix in _UNSUPPORTED_HOSTED_TOOL_PREFIXES)
+
+
+def translate_mcp_servers_to_responses_api(mcp_servers: object) -> List[Dict[str, Any]]:
+    """Translate Anthropic ``mcp_servers`` into OpenAI Responses ``mcp`` tools.
+
+    Anthropic: {"type": "url", "url": ..., "name": ..., "authorization_token": ...,
+                "tool_configuration": {"allowed_tools": [...]}}
+    Responses: {"type": "mcp", "server_label": ..., "server_url": ..., "headers": {...},
+                "allowed_tools": [...], "require_approval": "never"}
+    """
+    if not isinstance(mcp_servers, list):
+        return []
+    result: List[Dict[str, Any]] = []
+    for server in mcp_servers:
+        if not isinstance(server, dict):
+            continue
+        server_dict = cast(Dict[str, Any], server)
+        url = server_dict.get("url")
+        name = server_dict.get("name")
+        if not isinstance(url, str) or not url or not isinstance(name, str) or not name:
+            continue
+        mcp_tool: Dict[str, Any] = {
+            "type": "mcp",
+            "server_label": name,
+            "server_url": url,
+            # Anthropic executes these without a client approval round-trip.
+            "require_approval": "never",
+        }
+        token = server_dict.get("authorization_token")
+        if isinstance(token, str) and token:
+            mcp_tool["headers"] = {"Authorization": f"Bearer {token}"}
+        tool_config = server_dict.get("tool_configuration")
+        if isinstance(tool_config, dict):
+            allowed = tool_config.get("allowed_tools")
+            if isinstance(allowed, list) and allowed:
+                mcp_tool["allowed_tools"] = [t for t in allowed if isinstance(t, str)]
+        result.append(mcp_tool)
+    return result
+
+
+def _item_field(item: object, field: str) -> object:
+    if isinstance(item, dict):
+        return cast(Dict[str, object], item).get(field)
+    return getattr(item, field, None)
+
+
+def output_item_type(item: object) -> Optional[str]:
+    value = _item_field(item, "type")
+    return value if isinstance(value, str) else None
+
+
+def build_mcp_tool_blocks(item: object) -> List[Dict[str, Any]]:
+    """Translate a Responses ``mcp_call`` output item to Anthropic blocks.
+
+    Emits a ``mcp_tool_use`` block plus a ``mcp_tool_result`` block, mirroring how
+    Anthropic represents a server-executed MCP tool call in assistant content.
+    """
+    call_id_value = _item_field(item, "id")
+    call_id = call_id_value if isinstance(call_id_value, str) else ""
+    name_value = _item_field(item, "name")
+    name = name_value if isinstance(name_value, str) else ""
+    server_value = _item_field(item, "server_label")
+    server_label = server_value if isinstance(server_value, str) else ""
+    arguments = _item_field(item, "arguments")
+    try:
+        input_data = json.loads(arguments) if isinstance(arguments, str) and arguments else {}
+    except (json.JSONDecodeError, TypeError):
+        input_data = {}
+    error = _item_field(item, "error")
+    output = _item_field(item, "output")
+    is_error = bool(error)
+    if is_error:
+        result_text = error if isinstance(error, str) else ""
+    else:
+        result_text = output if isinstance(output, str) else ""
+
+    return [
+        {
+            "type": "mcp_tool_use",
+            "id": call_id,
+            "name": name,
+            "server_name": server_label,
+            "input": input_data,
+        },
+        {
+            "type": "mcp_tool_result",
+            "tool_use_id": call_id,
+            "is_error": is_error,
+            "content": [{"type": "text", "text": result_text}],
+        },
+    ]
+
+
 class LiteLLMAnthropicToResponsesAPIAdapter:
     """
     Converts Anthropic /v1/messages requests to OpenAI Responses API format and
@@ -386,6 +544,11 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 output = output_parts if output_parts else ""
                             else:
                                 output = str(inner)
+                            if block.get("is_error"):
+                                # Preserve the error signal the model reads: Claude Code marks
+                                # errored tool results with a <tool_use_error> wrapper, which
+                                # the Responses function_call_output has no dedicated field for.
+                                output = _wrap_tool_error(output)
                             # tool_result is a top-level item, not inside the message
                             input_items.append(
                                 {
@@ -483,22 +646,40 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         self,
         tools: List[AllAnthropicToolsValues],
     ) -> List[Dict[str, Any]]:
-        """Convert Anthropic tool definitions to Responses API function tools."""
+        """Convert Anthropic tool definitions to Responses API tools.
+
+        Client-side function tools map to Responses ``function`` tools. Anthropic
+        hosted tools are mapped where the Responses API has an equivalent
+        (``web_search`` -> ``web_search_preview``, ``code_execution`` ->
+        ``code_interpreter``) and otherwise skipped, rather than mangled into a
+        parameter-less function tool that the Responses API would reject.
+        """
         result: List[Dict[str, Any]] = []
         for tool in tools:
             tool_dict = cast(Dict[str, Any], tool)  # cast-ok: validated by the Anthropic tool schema
             tool_type = tool_dict.get("type", "")
+            tool_type_str = tool_type if isinstance(tool_type, str) else ""
             tool_name_value = tool_dict.get("name", "")
             tool_name = tool_name_value if isinstance(tool_name_value, str) else ""
-            # web_search tool
-            if (isinstance(tool_type, str) and tool_type.startswith("web_search")) or tool_name == "web_search":
+
+            # web_search hosted tool -> Responses web_search_preview
+            if tool_type_str.startswith("web_search") or tool_name == "web_search":
                 result.append({"type": "web_search_preview"})
                 continue
+            # code_execution hosted tool -> Responses code_interpreter
+            if tool_type_str.startswith("code_execution") or tool_name == "code_execution":
+                result.append({"type": "code_interpreter", "container": {"type": "auto"}})
+                continue
+            # Other Anthropic hosted tools have no Responses equivalent: skip rather
+            # than emit a parameter-less function tool the API would reject.
+            if _is_unsupported_hosted_tool(tool_type_str, tool_name, tool_dict):
+                continue
+
             func_tool: Dict[str, Any] = {"type": "function", "name": truncate_tool_name(tool_name)}
             if "description" in tool_dict:
                 func_tool["description"] = tool_dict["description"]
             if "input_schema" in tool_dict:
-                func_tool["parameters"] = tool_dict["input_schema"]
+                func_tool["parameters"] = sanitize_tool_parameters(tool_dict["input_schema"])
             if "strict" in tool_dict:
                 func_tool["strict"] = tool_dict["strict"]
             result.append(func_tool)
@@ -636,12 +817,18 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         if "top_p" in anthropic_request:
             responses_kwargs["top_p"] = anthropic_request["top_p"]
 
-        # tools
+        # tools (+ mcp_servers translated to Responses `mcp` tools)
         tools = anthropic_request.get("tools")
+        translated_tools: List[Dict[str, Any]] = []
         if tools:
-            responses_kwargs["tools"] = self.translate_tools_to_responses_api(
-                cast(List[AllAnthropicToolsValues], tools)  # cast-ok: validated by AnthropicMessagesRequest
+            translated_tools.extend(
+                self.translate_tools_to_responses_api(
+                    cast(List[AllAnthropicToolsValues], tools)  # cast-ok: validated by AnthropicMessagesRequest
+                )
             )
+        translated_tools.extend(translate_mcp_servers_to_responses_api(anthropic_request.get("mcp_servers")))
+        if translated_tools:
+            responses_kwargs["tools"] = translated_tools
 
         # tool_choice
         tool_choice = anthropic_request.get("tool_choice")
@@ -765,6 +952,10 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                     ).model_dump()
                 )
                 stop_reason = "tool_use"
+
+            elif output_item_type(item) == "mcp_call":
+                # Server-executed MCP tool call: emitted as content, turn continues.
+                content.extend(build_mcp_tool_blocks(item))
 
             elif isinstance(item, dict):
                 item_type = item.get("type")
