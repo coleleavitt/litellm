@@ -203,3 +203,87 @@ async def test_apply_guardrail_endpoint_without_optional_params(mock_proxy_loggi
         mock_guardrail.apply_guardrail.assert_called_once_with(
             inputs={"texts": ["Test text"]}, request_data={}, input_type="request"
         )
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_endpoint_forwards_metadata(mock_proxy_logging_ctx):
+    """Client-supplied metadata must reach the guardrail via request_data so
+    parameterized custom guardrails can read per-request configuration."""
+    from litellm.proxy.guardrails.guardrail_endpoints import apply_guardrail
+
+    with (
+        patch(
+            "litellm.proxy.guardrails.guardrail_endpoints.GUARDRAIL_REGISTRY"
+        ) as mock_registry,
+        mock_proxy_logging_ctx(),
+    ):
+        mock_guardrail = Mock(spec=CustomGuardrail)
+        mock_guardrail.apply_guardrail = AsyncMock(
+            return_value={"texts": ["Processed text"]}
+        )
+        mock_registry.get_initialized_guardrail_callback.return_value = mock_guardrail
+
+        request = ApplyGuardrailRequest(
+            guardrail_name="my-topic-guardrail",
+            text="What are tax loopholes?",
+            metadata={"forbidden_topics": ["taxes", "finance"]},
+        )
+
+        user_api_key_dict = UserAPIKeyAuth(api_key="test-key")
+
+        await apply_guardrail(
+            fastapi_request=Mock(),
+            request=request,
+            user_api_key_dict=user_api_key_dict,
+        )
+
+        mock_guardrail.apply_guardrail.assert_called_once_with(
+            inputs={"texts": ["What are tax loopholes?"]},
+            request_data={"metadata": {"forbidden_topics": ["taxes", "finance"]}},
+            input_type="request",
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_endpoint_forwards_metadata_with_messages(
+    mock_proxy_logging_ctx,
+):
+    """metadata and messages must coexist in request_data when both are sent."""
+    from litellm.proxy.guardrails.guardrail_endpoints import apply_guardrail
+
+    with (
+        patch(
+            "litellm.proxy.guardrails.guardrail_endpoints.GUARDRAIL_REGISTRY"
+        ) as mock_registry,
+        mock_proxy_logging_ctx(),
+    ):
+        mock_guardrail = Mock(spec=CustomGuardrail)
+        mock_guardrail.apply_guardrail = AsyncMock(
+            return_value={"texts": ["Processed text"]}
+        )
+        mock_registry.get_initialized_guardrail_callback.return_value = mock_guardrail
+
+        messages = [{"role": "user", "content": "What are tax loopholes?"}]
+        request = ApplyGuardrailRequest(
+            guardrail_name="my-topic-guardrail",
+            text="What are tax loopholes?",
+            messages=messages,
+            metadata={"forbidden_topics": ["taxes"]},
+        )
+
+        user_api_key_dict = UserAPIKeyAuth(api_key="test-key")
+
+        await apply_guardrail(
+            fastapi_request=Mock(),
+            request=request,
+            user_api_key_dict=user_api_key_dict,
+        )
+
+        mock_guardrail.apply_guardrail.assert_called_once_with(
+            inputs={"texts": ["What are tax loopholes?"]},
+            request_data={
+                "messages": messages,
+                "metadata": {"forbidden_topics": ["taxes"]},
+            },
+            input_type="request",
+        )
