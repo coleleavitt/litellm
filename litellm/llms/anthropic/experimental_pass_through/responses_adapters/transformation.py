@@ -709,7 +709,12 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
         # status -> stop_reason override
         if response.status == "incomplete":
-            stop_reason = "max_tokens"
+            incomplete_details = getattr(response, "incomplete_details", None)
+            if isinstance(incomplete_details, dict):
+                incomplete_reason = incomplete_details.get("reason")
+            else:
+                incomplete_reason = getattr(incomplete_details, "reason", None)
+            stop_reason = "refusal" if incomplete_reason in ("content_filter", "refusal") else "max_tokens"
 
         # usage
         raw_usage: Optional[ResponseAPIUsage] = response.usage

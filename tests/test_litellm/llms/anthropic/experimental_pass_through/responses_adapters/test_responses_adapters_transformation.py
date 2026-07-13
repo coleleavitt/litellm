@@ -1251,6 +1251,23 @@ class TestTranslateResponse:
         result: Any = _ADAPTER.translate_response(response)
         assert result["stop_reason"] == "max_tokens"
 
+    def test_incomplete_content_filter_preserves_refusal_stop_reason(self):
+        response = _make_mock_response(
+            output=[
+                {
+                    "type": "message",
+                    "content": [{"type": "refusal", "refusal": "I cannot help with that."}],
+                }
+            ],
+            status="incomplete",
+        )
+        response.incomplete_details = SimpleNamespace(reason="content_filter")
+
+        result: Any = _ADAPTER.translate_response(response)
+
+        assert result["content"] == [{"type": "text", "text": "I cannot help with that."}]
+        assert result["stop_reason"] == "refusal"
+
     def test_reasoning_item_becomes_thinking_block(self):
         """ResponseReasoningItem summaries -> Anthropic thinking content blocks."""
         reasoning = _make_reasoning_item(["Step 1: analyze. Step 2: conclude."])
