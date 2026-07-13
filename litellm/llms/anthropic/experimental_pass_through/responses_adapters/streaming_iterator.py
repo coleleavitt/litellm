@@ -41,6 +41,7 @@ class AnthropicResponsesStreamWrapper:
         responses_stream: Any,
         model: str,
         claude_code_per_turn_usage: bool = False,
+        tool_name_mapping: Optional[Dict[str, str]] = None,
     ) -> None:
         self.responses_stream = responses_stream
         self.model = model
@@ -53,6 +54,7 @@ class AnthropicResponsesStreamWrapper:
         self._sent_message_start = False
         self._sent_message_stop = False
         self._claude_code_per_turn_usage = claude_code_per_turn_usage
+        self._tool_name_mapping = tool_name_mapping or {}
         self._held_content_block_stop: Optional[Dict[str, Any]] = None
         self._chunk_queue: deque[Dict[str, Any]] = deque()
 
@@ -158,6 +160,7 @@ class AnthropicResponsesStreamWrapper:
                     getattr(item, "call_id", None) or (item.get("call_id") if isinstance(item, dict) else None) or ""
                 )
                 name = getattr(item, "name", None) or (item.get("name") if isinstance(item, dict) else None) or ""
+                name = self._tool_name_mapping.get(name, name)
                 block_idx = self._next_block_index()
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx

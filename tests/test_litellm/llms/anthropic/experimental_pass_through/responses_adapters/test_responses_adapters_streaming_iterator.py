@@ -77,6 +77,28 @@ def test_claude_code_per_turn_usage_precedes_tool_block_stop():
     assert chunks[5]["delta"]["stop_reason"] == "tool_use"
 
 
+def test_stream_restores_truncated_tool_name():
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=None,
+        model="m",
+        tool_name_mapping={"truncated_name": "original_long_tool_name"},
+    )
+    wrapper._process_event(
+        {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "item_1",
+                "call_id": "call_1",
+                "name": "truncated_name",
+            },
+        }
+    )
+
+    chunk = wrapper._chunk_queue.popleft()
+    assert chunk["content_block"]["name"] == "original_long_tool_name"
+
+
 def test_claude_code_per_turn_usage_is_attached_only_to_final_block_stop():
     wrapper = AnthropicResponsesStreamWrapper(
         responses_stream=None,

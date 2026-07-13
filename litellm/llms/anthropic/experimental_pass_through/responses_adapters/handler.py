@@ -180,6 +180,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
                 responses_stream=result,
                 model=model,
                 claude_code_per_turn_usage=_CLAUDE_CODE_PER_TURN_USAGE,
+                tool_name_mapping=tool_name_mapping,
             )
             return wrapper.async_anthropic_sse_wrapper()
 
@@ -263,6 +264,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
                 responses_stream=result,
                 model=model,
                 claude_code_per_turn_usage=_CLAUDE_CODE_PER_TURN_USAGE,
+                tool_name_mapping=tool_name_mapping,
             )
             return wrapper.async_anthropic_sse_wrapper()
 
