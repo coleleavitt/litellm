@@ -4,7 +4,22 @@ import json
 from collections import deque
 from typing import Any, AsyncIterator, Dict, Optional
 
+from pydantic import TypeAdapter
+
 from litellm._uuid import uuid
+
+_OBJECT_DICT_ADAPTER = TypeAdapter(Dict[str, object])
+
+
+def _get_field(value: object, field: str) -> object | None:
+    if isinstance(value, dict):
+        return _OBJECT_DICT_ADAPTER.validate_python(value).get(field)
+    attribute = getattr(value, field, None)
+    return attribute if isinstance(attribute, object) else None
+
+
+def _token_count(value: object | None) -> int:
+    return value if isinstance(value, int) else 0
 
 
 class AnthropicResponsesStreamWrapper:
@@ -71,6 +86,17 @@ class AnthropicResponsesStreamWrapper:
             self._chunk_queue.append(self._held_content_block_stop)
             self._held_content_block_stop = None
 
+    def _queue_error(self, message: str, request_id: Optional[str] = None) -> None:
+        self._held_content_block_stop = None
+        error_chunk: Dict[str, Any] = {
+            "type": "error",
+            "error": {"type": "api_error", "message": message},
+        }
+        if request_id:
+            error_chunk["request_id"] = request_id
+        self._chunk_queue.append(error_chunk)
+        self._sent_message_stop = True
+
     def _process_event(self, event: Any) -> None:
         """Convert one Responses API event into zero or more Anthropic chunks queued for emission."""
         event_type = getattr(event, "type", None)
@@ -78,6 +104,26 @@ class AnthropicResponsesStreamWrapper:
             event_type = event.get("type")
 
         if event_type is None:
+            return
+
+        if self._sent_message_stop:
+            return
+
+        if event_type == "error":
+            error_obj = _get_field(event, "error")
+            message = _get_field(event, "message") or _get_field(error_obj, "message") or "Upstream response failed"
+            self._queue_error(message=str(message))
+            return
+
+        if event_type == "response.failed":
+            response_obj = _get_field(event, "response")
+            error_obj = _get_field(response_obj, "error")
+            message = _get_field(error_obj, "message") or "Upstream response failed"
+            request_id = _get_field(response_obj, "id")
+            self._queue_error(
+                message=str(message),
+                request_id=str(request_id) if request_id else None,
+            )
             return
 
         # ---- message_start ----
@@ -212,11 +258,15 @@ class AnthropicResponsesStreamWrapper:
             item_id = (
                 getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else None) if item else None
             )
-            block_idx = (
-                self._item_id_to_block_index.get(item_id, self._current_block_index)
-                if item_id
-                else self._current_block_index
-            )
+            item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
+            if item_id:
+                block_idx = self._item_id_to_block_index.pop(item_id, None)
+                if block_idx is None:
+                    return
+            elif item_type in ("message", "function_call", "reasoning") and self._current_block_index >= 0:
+                block_idx = self._current_block_index
+            else:
+                return
             stop_chunk = {"type": "content_block_stop", "index": block_idx}
             if self._claude_code_per_turn_usage:
                 self._flush_held_content_block_stop()
@@ -228,12 +278,9 @@ class AnthropicResponsesStreamWrapper:
         # ---- response completed -> message_delta + message_stop ----
         if event_type in (
             "response.completed",
-            "response.failed",
             "response.incomplete",
         ):
-            response_obj = getattr(event, "response", None) or (
-                event.get("response") if isinstance(event, dict) else None
-            )
+            response_obj = _get_field(event, "response")
             stop_reason = "end_turn"
             input_tokens = 0
             output_tokens = 0
@@ -241,31 +288,35 @@ class AnthropicResponsesStreamWrapper:
             cache_read_tokens = 0
 
             if response_obj is not None:
-                status = getattr(response_obj, "status", None)
+                status = _get_field(response_obj, "status")
                 if status == "incomplete":
                     stop_reason = "max_tokens"
-                usage = getattr(response_obj, "usage", None)
+                    incomplete_details = _get_field(response_obj, "incomplete_details")
+                    incomplete_reason = _get_field(incomplete_details, "reason")
+                    if incomplete_reason in ("content_filter", "refusal"):
+                        stop_reason = "refusal"
+                usage = _get_field(response_obj, "usage")
                 if usage is not None:
-                    total_input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-                    output_tokens = getattr(usage, "output_tokens", 0) or 0
-                    input_details = getattr(usage, "input_tokens_details", None)
-                    cache_creation_tokens = int(
-                        getattr(usage, "cache_creation_input_tokens", 0)
-                        or getattr(input_details, "cache_write_tokens", 0)
-                        or 0
+                    total_input_tokens = _token_count(_get_field(usage, "input_tokens"))
+                    output_tokens = _token_count(_get_field(usage, "output_tokens"))
+                    input_details = _get_field(usage, "input_tokens_details")
+                    cache_creation_tokens = _token_count(
+                        _get_field(usage, "cache_creation_input_tokens")
+                        or _get_field(usage, "cache_creation_tokens")
+                        or _get_field(input_details, "cache_write_tokens")
+                        or _get_field(input_details, "cache_creation_tokens")
                     )
-                    cache_read_tokens = int(
-                        getattr(usage, "cache_read_input_tokens", 0) or getattr(input_details, "cached_tokens", 0) or 0
+                    cache_read_tokens = _token_count(
+                        _get_field(usage, "cache_read_input_tokens") or _get_field(input_details, "cached_tokens")
                     )
                     input_tokens = max(0, total_input_tokens - cache_creation_tokens - cache_read_tokens)
 
             # Check if tool_use was in the output to override stop_reason
-            if response_obj is not None:
-                output = getattr(response_obj, "output", []) or []
+            if response_obj is not None and event_type == "response.completed":
+                output = _get_field(response_obj, "output")
+                output = output if isinstance(output, (list, tuple)) else ()
                 for out_item in output:
-                    out_type = getattr(out_item, "type", None) or (
-                        out_item.get("type") if isinstance(out_item, dict) else None
-                    )
+                    out_type = _get_field(out_item, "type")
                     if out_type == "function_call":
                         stop_reason = "tool_use"
                         break
@@ -301,6 +352,9 @@ class AnthropicResponsesStreamWrapper:
         # Return any queued chunks first
         if self._chunk_queue:
             return self._chunk_queue.popleft()
+
+        if self._sent_message_stop:
+            raise StopAsyncIteration
 
         # Emit message_start if not yet done (fallback if response.created wasn't fired)
         if not self._sent_message_start:

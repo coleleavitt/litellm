@@ -129,6 +129,130 @@ def test_claude_code_per_turn_usage_is_attached_only_to_final_block_stop():
     }
 
 
+def test_unmapped_output_item_done_does_not_close_the_current_block():
+    chunks = _process_all(
+        [
+            {"type": "response.output_item.added", "item": {"type": "message", "id": "message_1"}},
+            {"type": "response.output_item.done", "item": {"type": "image_generation_call", "id": "image_1"}},
+        ]
+    )
+
+    assert chunks == [
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }
+    ]
+
+
+def test_response_failed_emits_error_without_success_terminal_events():
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=None,
+        model="m",
+        claude_code_per_turn_usage=True,
+    )
+    events = [
+        {"type": "response.output_item.added", "item": {"type": "message", "id": "message_1"}},
+        {"type": "response.output_item.done", "item": {"type": "message", "id": "message_1"}},
+        {
+            "type": "response.failed",
+            "response": SimpleNamespace(
+                id="response_1",
+                error=SimpleNamespace(code="server_error", message="upstream failed"),
+            ),
+        },
+    ]
+
+    for event in events:
+        wrapper._process_event(event)
+
+    chunks = list(wrapper._chunk_queue)
+    assert chunks == [
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "error",
+            "error": {"type": "api_error", "message": "upstream failed"},
+            "request_id": "response_1",
+        },
+    ]
+    assert wrapper._held_content_block_stop is None
+
+
+def test_top_level_error_emits_anthropic_error():
+    events = (
+        {"type": "error", "code": "server_error", "message": "stream failed"},
+        {"type": "error", "error": {"code": "server_error", "message": "stream failed"}},
+    )
+
+    for event in events:
+        assert _process_all([event]) == [
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": "stream failed"},
+            }
+        ]
+
+
+def test_incomplete_reason_maps_to_anthropic_stop_reason():
+    for incomplete_reason, stop_reason in (
+        ("max_output_tokens", "max_tokens"),
+        ("content_filter", "refusal"),
+        ("refusal", "refusal"),
+        ("unknown", "max_tokens"),
+    ):
+        chunks = _process_all(
+            [
+                {
+                    "type": "response.incomplete",
+                    "response": SimpleNamespace(
+                        status="incomplete",
+                        incomplete_details=SimpleNamespace(reason=incomplete_reason),
+                        output=[],
+                        usage=None,
+                    ),
+                }
+            ]
+        )
+
+        assert chunks[0]["delta"]["stop_reason"] == stop_reason
+        assert chunks[1] == {"type": "message_stop"}
+
+
+def test_dict_terminal_usage_supports_cache_creation_aliases():
+    for cache_creation_key in ("cache_write_tokens", "cache_creation_tokens"):
+        chunks = _process_all(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 50,
+                            "output_tokens": 7,
+                            "input_tokens_details": {
+                                "cached_tokens": 30,
+                                cache_creation_key: 5,
+                            },
+                        },
+                    },
+                }
+            ]
+        )
+
+        assert chunks[0]["usage"] == {
+            "input_tokens": 15,
+            "output_tokens": 7,
+            "cache_creation_input_tokens": 5,
+            "cache_read_input_tokens": 30,
+        }
+
+
 class TestProcessEventTextDeltaWithoutOutputItemAdded:
     """Streams that skip response.output_item.added (e.g. LMStudio) must still
     open a text block before any delta and never emit index -1."""
