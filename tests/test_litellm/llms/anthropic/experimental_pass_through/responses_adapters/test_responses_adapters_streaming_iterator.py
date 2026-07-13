@@ -24,11 +24,11 @@ def _process_all(events: list) -> list:
     return list(wrapper._chunk_queue)
 
 
-def test_claude_code_per_turn_usage_precedes_tool_block_stop():
+def test_seeded_prompt_tokens_single_message_start_with_tool_use():
     wrapper = AnthropicResponsesStreamWrapper(
         responses_stream=None,
         model="m",
-        claude_code_per_turn_usage=True,
+        prompt_tokens=57,
     )
     events = [
         {"type": "response.created"},
@@ -56,28 +56,32 @@ def test_claude_code_per_turn_usage_precedes_tool_block_stop():
         wrapper._process_event(event)
 
     chunks = list(wrapper._chunk_queue)
+    # Exactly one message_start. A second one mid-stream violates the Anthropic
+    # SSE contract and trips the @anthropic-ai/sdk stream accumulator.
     assert [chunk["type"] for chunk in chunks] == [
         "message_start",
         "content_block_start",
         "content_block_delta",
-        "message_start",
         "content_block_stop",
         "message_delta",
         "message_stop",
     ]
-    assert chunks[3]["message"]["usage"] == {
+    # message_start carries the up-front prompt-token estimate so the live
+    # counter shows a real number immediately instead of jumping from 0.
+    assert chunks[0]["message"]["usage"] == {
+        "input_tokens": 57,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    # message_delta carries the authoritative usage from response.completed.
+    assert chunks[4]["usage"] == {
         "input_tokens": 12,
         "output_tokens": 21,
         "cache_creation_input_tokens": 5,
         "cache_read_input_tokens": 40,
     }
-    assert chunks[5]["usage"] == {
-        "input_tokens": 12,
-        "output_tokens": 21,
-        "cache_creation_input_tokens": 5,
-        "cache_read_input_tokens": 40,
-    }
-    assert chunks[5]["delta"]["stop_reason"] == "tool_use"
+    assert chunks[4]["delta"]["stop_reason"] == "tool_use"
 
 
 def test_stream_restores_truncated_tool_name():
@@ -102,11 +106,11 @@ def test_stream_restores_truncated_tool_name():
     assert chunk["content_block"]["name"] == "original_long_tool_name"
 
 
-def test_claude_code_per_turn_usage_is_attached_only_to_final_block_stop():
+def test_single_message_start_across_multiple_blocks():
     wrapper = AnthropicResponsesStreamWrapper(
         responses_stream=None,
         model="m",
-        claude_code_per_turn_usage=True,
+        prompt_tokens=57,
     )
     events = [
         {"type": "response.created"},
@@ -140,13 +144,13 @@ def test_claude_code_per_turn_usage_is_attached_only_to_final_block_stop():
         "content_block_start",
         "content_block_stop",
         "content_block_start",
-        "message_start",
         "content_block_stop",
         "message_delta",
         "message_stop",
     ]
-    assert [chunk["type"] for chunk in chunks].count("message_start") == 2
-    assert chunks[4]["message"]["usage"] == {
+    assert [chunk["type"] for chunk in chunks].count("message_start") == 1
+    assert chunks[0]["message"]["usage"]["input_tokens"] == 57
+    assert chunks[5]["usage"] == {
         "input_tokens": 12,
         "output_tokens": 21,
         "cache_creation_input_tokens": 5,
@@ -175,7 +179,6 @@ def test_response_failed_emits_error_without_success_terminal_events():
     wrapper = AnthropicResponsesStreamWrapper(
         responses_stream=None,
         model="m",
-        claude_code_per_turn_usage=True,
     )
     events = [
         {"type": "response.output_item.added", "item": {"type": "message", "id": "message_1"}},
@@ -200,15 +203,18 @@ def test_response_failed_emits_error_without_success_terminal_events():
             "content_block": {"type": "text", "text": ""},
         },
         {
+            "type": "content_block_stop",
+            "index": 0,
+        },
+        {
             "type": "error",
             "error": {"type": "api_error", "message": "upstream failed"},
             "request_id": "response_1",
         },
     ]
-    assert wrapper._held_content_block_stop is None
 
 
-async def test_upstream_eof_does_not_release_a_held_tool_call():
+async def test_upstream_eof_emits_error_after_completed_blocks():
     async def events():
         yield {
             "type": "response.output_item.added",
@@ -219,13 +225,13 @@ async def test_upstream_eof_does_not_release_a_held_tool_call():
     wrapper = AnthropicResponsesStreamWrapper(
         responses_stream=events(),
         model="m",
-        claude_code_per_turn_usage=True,
     )
     chunks = [chunk async for chunk in wrapper]
 
     assert [chunk["type"] for chunk in chunks] == [
         "message_start",
         "content_block_start",
+        "content_block_stop",
         "error",
     ]
     assert chunks[-1]["error"]["message"] == "Upstream response ended before a terminal event"

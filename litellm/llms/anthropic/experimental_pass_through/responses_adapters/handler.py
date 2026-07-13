@@ -4,10 +4,10 @@ Handler for the Anthropic v1/messages -> OpenAI Responses API path.
 Used when the target model is an OpenAI or Azure model.
 """
 
-import os
 from typing import Any, AsyncIterator, Coroutine, Dict, List, Optional, Union, cast
 
 import litellm
+from litellm._logging import verbose_logger
 from litellm.types.llms.anthropic import AnthropicMessagesRequest
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
@@ -19,12 +19,67 @@ from .streaming_iterator import AnthropicResponsesStreamWrapper
 from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 
 _ADAPTER = LiteLLMAnthropicToResponsesAPIAdapter()
-_CLAUDE_CODE_PER_TURN_USAGE = os.getenv("LITELLM_CLAUDE_CODE_PER_TURN_USAGE", "").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+
+
+def _system_to_text(system: Optional[Any]) -> str:
+    """Flatten an Anthropic ``system`` value (str or list of text blocks) to text."""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts = [b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _estimate_prompt_input_tokens(
+    *,
+    model: str,
+    messages: List[Dict],
+    system: Optional[Any] = None,
+    tools: Optional[List[Dict]] = None,
+) -> Optional[int]:
+    """Best-effort prompt-token count used to seed the first Anthropic ``message_start``.
+
+    OpenAI's Responses API reports usage only at ``response.completed``, so the initial
+    ``message_start`` would otherwise carry ``input_tokens: 0``. Claude Code reads the live
+    input-token count solely from ``message_start`` (never from ``message_delta``), so it would
+    show 0 for the whole turn and then jump to the real value at turn end. Counting the prompt
+    up front removes that jump; the authoritative usage from ``response.completed`` still
+    reconciles the exact totals via ``message_delta``.
+
+    Returns ``None`` on any failure so the stream falls back to the previous ``0`` behavior.
+    """
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+            LiteLLMAnthropicMessagesAdapter,
+        )
+
+        adapter = LiteLLMAnthropicMessagesAdapter()
+        try:
+            openai_messages = adapter.translate_anthropic_messages_to_openai(messages=cast(Any, messages))
+        except Exception:
+            openai_messages = cast(Any, messages)
+
+        openai_tools: Optional[List[Dict[str, Any]]] = None
+        if tools:
+            try:
+                translated_tools, _ = adapter.translate_anthropic_tools_to_openai(tools=cast(Any, tools))
+                openai_tools = cast(List[Dict[str, Any]], translated_tools)
+            except Exception:
+                openai_tools = tools
+
+        total = litellm.token_counter(
+            model=model,
+            messages=cast(Any, openai_messages),
+            tools=cast(Any, openai_tools),
+        )
+        system_text = _system_to_text(system)
+        if system_text:
+            total += litellm.token_counter(model=model, text=system_text)
+        return total if total > 0 else None
+    except Exception as e:
+        verbose_logger.debug("responses_adapter: prompt-token seeding failed: %s", e)
+        return None
 
 
 def _create_tool_name_mapping(tools: Optional[List[Dict]]) -> Dict[str, str]:
@@ -192,7 +247,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
             wrapper = AnthropicResponsesStreamWrapper(
                 responses_stream=result,
                 model=model,
-                claude_code_per_turn_usage=_CLAUDE_CODE_PER_TURN_USAGE,
+                prompt_tokens=_estimate_prompt_input_tokens(model=model, messages=messages, system=system, tools=tools),
                 tool_name_mapping=tool_name_mapping,
                 stop_sequences=stop_sequences,
             )
@@ -280,7 +335,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
             wrapper = AnthropicResponsesStreamWrapper(
                 responses_stream=result,
                 model=model,
-                claude_code_per_turn_usage=_CLAUDE_CODE_PER_TURN_USAGE,
+                prompt_tokens=_estimate_prompt_input_tokens(model=model, messages=messages, system=system, tools=tools),
                 tool_name_mapping=tool_name_mapping,
                 stop_sequences=stop_sequences,
             )

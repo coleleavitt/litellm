@@ -49,7 +49,7 @@ class AnthropicResponsesStreamWrapper:
         self,
         responses_stream: Any,
         model: str,
-        claude_code_per_turn_usage: bool = False,
+        prompt_tokens: Optional[int] = None,
         tool_name_mapping: Optional[Dict[str, str]] = None,
         stop_sequences: Optional[List[str]] = None,
     ) -> None:
@@ -63,9 +63,8 @@ class AnthropicResponsesStreamWrapper:
         self._pending_tool_ids: Dict[str, str] = {}  # item_id -> call_id / name accumulator
         self._sent_message_start = False
         self._sent_message_stop = False
-        self._claude_code_per_turn_usage = claude_code_per_turn_usage
+        self._prompt_tokens = prompt_tokens
         self._tool_name_mapping = tool_name_mapping or {}
-        self._held_content_block_stop: Optional[Dict[str, Any]] = None
         self._chunk_queue: deque[Dict[str, Any]] = deque()
         # stop_sequences are emulated (no native Responses param): buffer text so a
         # sequence spanning multiple deltas is caught, then truncate and stop.
@@ -73,9 +72,9 @@ class AnthropicResponsesStreamWrapper:
         self._stopped_by_sequence: Optional[str] = None
         self._text_hold: Dict[int, str] = {}  # block_index -> withheld tail
 
-    def _make_message_start(self, usage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _make_message_start(self) -> Dict[str, Any]:
         initial_usage = {
-            "input_tokens": 0,
+            "input_tokens": self._prompt_tokens or 0,
             "output_tokens": 0,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0,
@@ -90,7 +89,7 @@ class AnthropicResponsesStreamWrapper:
                 "model": self.model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {**initial_usage, **(usage or {})},
+                "usage": initial_usage,
             },
         }
 
@@ -98,14 +97,8 @@ class AnthropicResponsesStreamWrapper:
         self._current_block_index += 1
         return self._current_block_index
 
-    def _flush_held_content_block_stop(self) -> None:
-        if self._held_content_block_stop is not None:
-            self._chunk_queue.append(self._held_content_block_stop)
-            self._held_content_block_stop = None
-
     def _emit_mcp_call_blocks(self, item: object) -> None:
         """Emit a server-executed MCP call as atomic mcp_tool_use + mcp_tool_result blocks."""
-        self._flush_held_content_block_stop()
         for block in build_mcp_tool_blocks(item):
             block_idx = self._next_block_index()
             self._chunk_queue.append(
@@ -143,7 +136,6 @@ class AnthropicResponsesStreamWrapper:
             # Drop this block from the id map so its later output_item.done is a no-op.
             if item_id:
                 self._item_id_to_block_index.pop(item_id, None)
-            self._flush_held_content_block_stop()
             self._chunk_queue.append({"type": "content_block_stop", "index": block_idx})
             return
         hold_len = partial_stop_suffix_len(combined, self._stop_sequences)
@@ -154,7 +146,6 @@ class AnthropicResponsesStreamWrapper:
             self._queue_text_delta(block_idx, combined)
 
     def _queue_error(self, message: str, request_id: Optional[str] = None) -> None:
-        self._held_content_block_stop = None
         error_chunk: Dict[str, Any] = {
             "type": "error",
             "error": {"type": "api_error", "message": message},
@@ -210,7 +201,6 @@ class AnthropicResponsesStreamWrapper:
 
         # ---- content_block_start for a new output message item ----
         if event_type == "response.output_item.added":
-            self._flush_held_content_block_stop()
             item = getattr(event, "item", None) or (event.get("item") if isinstance(event, dict) else None)
             if item is None:
                 return
@@ -275,7 +265,6 @@ class AnthropicResponsesStreamWrapper:
                 block_idx = self._next_block_index()
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx
-                self._flush_held_content_block_stop()
                 self._chunk_queue.append(
                     {
                         "type": "content_block_start",
@@ -374,12 +363,7 @@ class AnthropicResponsesStreamWrapper:
                         },
                     }
                 )
-            stop_chunk = {"type": "content_block_stop", "index": block_idx}
-            if self._claude_code_per_turn_usage:
-                self._flush_held_content_block_stop()
-                self._held_content_block_stop = stop_chunk
-            else:
-                self._chunk_queue.append(stop_chunk)
+            self._chunk_queue.append({"type": "content_block_stop", "index": block_idx})
             return
 
         # ---- response completed -> message_delta + message_stop ----
@@ -450,10 +434,6 @@ class AnthropicResponsesStreamWrapper:
                 usage_delta["cache_read_input_tokens"] = cache_read_tokens
             if service_tier is not None:
                 usage_delta["service_tier"] = service_tier
-
-            if self._claude_code_per_turn_usage and self._held_content_block_stop is not None:
-                self._chunk_queue.append(self._make_message_start(usage_delta))
-                self._flush_held_content_block_stop()
 
             self._chunk_queue.append(
                 {
