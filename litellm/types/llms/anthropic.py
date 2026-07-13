@@ -623,7 +623,14 @@ class AnthropicResponseUsageBlock(BaseModel):
     output_tokens: int
 
 
-AnthropicFinishReason = Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
+AnthropicFinishReason = Literal[
+    "end_turn",
+    "max_tokens",
+    "stop_sequence",
+    "tool_use",
+    "pause_turn",
+    "refusal",
+]
 
 
 class AnthropicResponse(BaseModel):
