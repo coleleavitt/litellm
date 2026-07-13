@@ -2,13 +2,19 @@
 ## Translates OpenAI call to Anthropic `/v1/messages` format
 import json
 from collections import deque
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from pydantic import TypeAdapter
 
 from litellm._uuid import uuid
 
-from .transformation import encode_reasoning_item_signature
+from .transformation import (
+    encode_reasoning_item_signature,
+    find_earliest_stop_sequence,
+    map_service_tier,
+    normalize_stop_sequences,
+    partial_stop_suffix_len,
+)
 
 _OBJECT_DICT_ADAPTER = TypeAdapter(Dict[str, object])
 
@@ -44,6 +50,7 @@ class AnthropicResponsesStreamWrapper:
         model: str,
         claude_code_per_turn_usage: bool = False,
         tool_name_mapping: Optional[Dict[str, str]] = None,
+        stop_sequences: Optional[List[str]] = None,
     ) -> None:
         self.responses_stream = responses_stream
         self.model = model
@@ -59,6 +66,11 @@ class AnthropicResponsesStreamWrapper:
         self._tool_name_mapping = tool_name_mapping or {}
         self._held_content_block_stop: Optional[Dict[str, Any]] = None
         self._chunk_queue: deque[Dict[str, Any]] = deque()
+        # stop_sequences are emulated (no native Responses param): buffer text so a
+        # sequence spanning multiple deltas is caught, then truncate and stop.
+        self._stop_sequences = normalize_stop_sequences(stop_sequences)
+        self._stopped_by_sequence: Optional[str] = None
+        self._text_hold: Dict[int, str] = {}  # block_index -> withheld tail
 
     def _make_message_start(self, usage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         initial_usage = {
@@ -89,6 +101,42 @@ class AnthropicResponsesStreamWrapper:
         if self._held_content_block_stop is not None:
             self._chunk_queue.append(self._held_content_block_stop)
             self._held_content_block_stop = None
+
+    def _queue_text_delta(self, block_idx: int, text: str) -> None:
+        if text:
+            self._chunk_queue.append(
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "text_delta", "text": text},
+                }
+            )
+
+    def _emit_text_with_stop_check(self, block_idx: int, item_id: Optional[str], delta: str) -> None:
+        """Emit text while emulating stop sequences.
+
+        Withholds any trailing chars that could still grow into a stop sequence; on a
+        full match, emits the prefix, closes the block, and records the stop so the rest
+        of the stream is suppressed.
+        """
+        combined = self._text_hold.pop(block_idx, "") + delta
+        match = find_earliest_stop_sequence(combined, self._stop_sequences)
+        if match is not None:
+            idx, seq = match
+            self._queue_text_delta(block_idx, combined[:idx])
+            self._stopped_by_sequence = seq
+            # Drop this block from the id map so its later output_item.done is a no-op.
+            if item_id:
+                self._item_id_to_block_index.pop(item_id, None)
+            self._flush_held_content_block_stop()
+            self._chunk_queue.append({"type": "content_block_stop", "index": block_idx})
+            return
+        hold_len = partial_stop_suffix_len(combined, self._stop_sequences)
+        if hold_len:
+            self._text_hold[block_idx] = combined[len(combined) - hold_len :]
+            self._queue_text_delta(block_idx, combined[: len(combined) - hold_len])
+        else:
+            self._queue_text_delta(block_idx, combined)
 
     def _queue_error(self, message: str, request_id: Optional[str] = None) -> None:
         self._held_content_block_stop = None
@@ -128,6 +176,14 @@ class AnthropicResponsesStreamWrapper:
                 message=str(message),
                 request_id=str(request_id) if request_id else None,
             )
+            return
+
+        # Once a stop sequence has been hit, suppress all further content and wait for
+        # the terminal event (Anthropic stops emitting at the sequence).
+        if self._stopped_by_sequence is not None and event_type not in (
+            "response.completed",
+            "response.incomplete",
+        ):
             return
 
         # ---- message_start ----
@@ -212,13 +268,10 @@ class AnthropicResponsesStreamWrapper:
                         "content_block": {"type": "text", "text": ""},
                     }
                 )
-            self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "text_delta", "text": delta},
-                }
-            )
+            if not self._stop_sequences:
+                self._queue_text_delta(block_idx, delta)
+            else:
+                self._emit_text_with_stop_check(block_idx, item_id, delta)
             return
 
         if event_type == "response.refusal.delta":
@@ -286,6 +339,10 @@ class AnthropicResponsesStreamWrapper:
                 block_idx = self._current_block_index
             else:
                 return
+            # Flush any text withheld for stop-sequence detection now that the block is done.
+            held = self._text_hold.pop(block_idx, "")
+            if held:
+                self._queue_text_delta(block_idx, held)
             signature = encode_reasoning_item_signature(item)
             if signature is not None:
                 self._chunk_queue.append(
@@ -318,6 +375,7 @@ class AnthropicResponsesStreamWrapper:
             cache_creation_tokens = 0
             cache_read_tokens = 0
 
+            service_tier: Optional[str] = None
             if response_obj is not None:
                 status = _get_field(response_obj, "status")
                 if status == "incomplete":
@@ -326,6 +384,9 @@ class AnthropicResponsesStreamWrapper:
                     incomplete_reason = _get_field(incomplete_details, "reason")
                     if incomplete_reason in ("content_filter", "refusal"):
                         stop_reason = "refusal"
+                    elif incomplete_reason in ("model_context_window_exceeded", "context_length_exceeded"):
+                        stop_reason = "model_context_window_exceeded"
+                service_tier = map_service_tier(_get_field(response_obj, "service_tier"))
                 usage = _get_field(response_obj, "usage")
                 if usage is not None:
                     total_input_tokens = _token_count(_get_field(usage, "input_tokens"))
@@ -356,6 +417,10 @@ class AnthropicResponsesStreamWrapper:
                     if any(_get_field(part, "type") == "refusal" for part in content):
                         stop_reason = "refusal"
 
+            # An emulated stop sequence takes precedence over the natural stop reason.
+            if self._stopped_by_sequence is not None:
+                stop_reason = "stop_sequence"
+
             usage_delta: Dict[str, Any] = {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -364,6 +429,8 @@ class AnthropicResponsesStreamWrapper:
                 usage_delta["cache_creation_input_tokens"] = cache_creation_tokens
             if cache_read_tokens:
                 usage_delta["cache_read_input_tokens"] = cache_read_tokens
+            if service_tier is not None:
+                usage_delta["service_tier"] = service_tier
 
             if self._claude_code_per_turn_usage and self._held_content_block_stop is not None:
                 self._chunk_queue.append(self._make_message_start(usage_delta))
@@ -372,7 +439,7 @@ class AnthropicResponsesStreamWrapper:
             self._chunk_queue.append(
                 {
                     "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": self._stopped_by_sequence},
                     "usage": usage_delta,
                 }
             )

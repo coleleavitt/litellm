@@ -630,6 +630,7 @@ AnthropicFinishReason = Literal[
     "tool_use",
     "pause_turn",
     "refusal",
+    "model_context_window_exceeded",
 ]
 
 

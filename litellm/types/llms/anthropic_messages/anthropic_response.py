@@ -71,6 +71,11 @@ class AnthropicUsage(TypedDict, total=False):
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
 
+    """
+    Service tier that handled the request (e.g. "standard", "priority").
+    """
+    service_tier: str
+
 
 class AnthropicMessagesResponse(TypedDict, total=False):
     """

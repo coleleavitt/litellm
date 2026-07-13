@@ -1418,3 +1418,58 @@ class TestTranslateResponse:
         assert "text" in types
         assert "tool_use" in types
         assert result["stop_reason"] == "tool_use"
+
+    def test_stop_sequence_truncates_text_and_sets_stop_reason(self):
+        """A stop sequence in output text truncates the text and sets stop_reason."""
+        response = _make_mock_response(output=[_make_output_message(["keep this </block> drop this"])])
+        result: Any = _ADAPTER.translate_response(response, stop_sequences=["</block>"])
+        assert result["content"][0]["text"] == "keep this "
+        assert result["stop_reason"] == "stop_sequence"
+        assert result["stop_sequence"] == "</block>"
+
+    def test_stop_sequence_drops_later_content_blocks(self):
+        """Everything after the stop sequence, including later blocks, is removed."""
+        text_msg = _make_output_message(["answer STOP"])
+        fc = _make_function_call_item("call_1", "tool_a", "{}")
+        response = _make_mock_response(output=[text_msg, fc])
+        result: Any = _ADAPTER.translate_response(response, stop_sequences=["STOP"])
+        assert [b["type"] for b in result["content"]] == ["text"]
+        assert result["content"][0]["text"] == "answer "
+        assert result["stop_reason"] == "stop_sequence"
+        assert result["stop_sequence"] == "STOP"
+
+    def test_stop_sequence_absent_leaves_response_unchanged(self):
+        response = _make_mock_response(output=[_make_output_message(["no marker here"])])
+        result: Any = _ADAPTER.translate_response(response, stop_sequences=["</block>"])
+        assert result["content"][0]["text"] == "no marker here"
+        assert result["stop_reason"] == "end_turn"
+        assert result["stop_sequence"] is None
+
+    def test_stop_sequence_not_applied_on_refusal(self):
+        """Refusal takes precedence over an emulated stop sequence."""
+        response = _make_mock_response(
+            output=[
+                {
+                    "type": "message",
+                    "content": [{"type": "refusal", "refusal": "I cannot STOP help."}],
+                }
+            ],
+        )
+        result: Any = _ADAPTER.translate_response(response, stop_sequences=["STOP"])
+        assert result["stop_reason"] == "refusal"
+        assert result["content"][0]["text"] == "I cannot STOP help."
+
+    def test_service_tier_mapped_into_usage(self):
+        response = _make_mock_response(output=[_make_output_message(["ok"])])
+        response.service_tier = "default"
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["usage"]["service_tier"] == "standard"
+
+    def test_model_context_window_exceeded_maps_stop_reason(self):
+        response = _make_mock_response(
+            output=[_make_output_message(["partial"])],
+            status="incomplete",
+        )
+        response.incomplete_details = SimpleNamespace(reason="model_context_window_exceeded")
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["stop_reason"] == "model_context_window_exceeded"

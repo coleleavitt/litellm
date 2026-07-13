@@ -10,7 +10,7 @@ import binascii
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Literal, Optional, Union, cast
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -175,6 +175,97 @@ def _context_management_clears_thinking(context_management: object) -> bool:
     except ValidationError:
         return False
     return any(edit.type == "clear_thinking_20251015" and edit.keep == "none" for edit in parsed.edits)
+
+
+# OpenAI Responses service_tier values -> Anthropic service_tier values.
+_SERVICE_TIER_MAP = {
+    "default": "standard",
+    "auto": "standard",
+    "flex": "standard",
+    "scale": "standard",
+    "priority": "priority",
+}
+
+
+def map_service_tier(value: object) -> Optional[str]:
+    """Map an OpenAI Responses service_tier to the closest Anthropic value.
+
+    Unknown values pass through unchanged so we never invent data; ``None`` is
+    returned when the response carried no service tier.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    return _SERVICE_TIER_MAP.get(value, value)
+
+
+def normalize_stop_sequences(stop_sequences: object) -> Tuple[str, ...]:
+    """Return the non-empty string stop sequences from an arbitrary value."""
+    if not isinstance(stop_sequences, (list, tuple)):
+        return ()
+    return tuple(s for s in stop_sequences if isinstance(s, str) and s)
+
+
+def find_earliest_stop_sequence(text: str, stop_sequences: Sequence[str]) -> Optional[Tuple[int, str]]:
+    """Return ``(index, sequence)`` of the earliest stop-sequence match in ``text``.
+
+    The Responses API has no native stop parameter, so stop sequences are emulated
+    by scanning generated text. Ties on index are broken by the longest sequence so
+    truncation is deterministic.
+    """
+    best: Optional[Tuple[int, str]] = None
+    for seq in stop_sequences:
+        if not seq:
+            continue
+        idx = text.find(seq)
+        if idx == -1:
+            continue
+        if best is None or idx < best[0] or (idx == best[0] and len(seq) > len(best[1])):
+            best = (idx, seq)
+    return best
+
+
+def partial_stop_suffix_len(buffer: str, stop_sequences: Sequence[str]) -> int:
+    """Length of the longest suffix of ``buffer`` that is a proper prefix of a stop sequence.
+
+    Those trailing characters must be withheld while streaming because a later delta
+    could grow them into a full stop-sequence match.
+    """
+    max_len = 0
+    for seq in stop_sequences:
+        if not seq:
+            continue
+        limit = min(len(buffer), len(seq) - 1)
+        for k in range(limit, max_len, -1):
+            if buffer[-k:] == seq[:k]:
+                max_len = k
+                break
+    return max_len
+
+
+def apply_stop_sequences_to_content(
+    content: List[Dict[str, Any]],
+    stop_sequences: Sequence[str],
+) -> Optional[str]:
+    """Truncate ``content`` in place at the first stop-sequence hit in a text block.
+
+    Mirrors Anthropic semantics: the stop sequence and everything after it (including
+    any later content blocks) is removed and the matched sequence is returned. Returns
+    ``None`` when no stop sequence appears in the output text.
+    """
+    for i, block in enumerate(content):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = block.get("text", "")
+        if not isinstance(text, str):
+            continue
+        match = find_earliest_stop_sequence(text, stop_sequences)
+        if match is None:
+            continue
+        idx, seq = match
+        block["text"] = text[:idx]
+        del content[i + 1 :]
+        return seq
+    return None
 
 
 class LiteLLMAnthropicToResponsesAPIAdapter:
@@ -616,6 +707,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         self,
         response: ResponsesAPIResponse,
         tool_name_mapping: Optional[Dict[str, str]] = None,
+        stop_sequences: Optional[Sequence[str]] = None,
     ) -> AnthropicMessagesResponse:
         """
         Translate an OpenAI ResponsesAPIResponse to AnthropicMessagesResponse.
@@ -714,7 +806,22 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                 incomplete_reason = incomplete_details.get("reason")
             else:
                 incomplete_reason = getattr(incomplete_details, "reason", None)
-            stop_reason = "refusal" if incomplete_reason in ("content_filter", "refusal") else "max_tokens"
+            if incomplete_reason in ("content_filter", "refusal"):
+                stop_reason = "refusal"
+            elif incomplete_reason in ("model_context_window_exceeded", "context_length_exceeded"):
+                # The Responses API surfaces input overflow as a 4xx today; this branch
+                # keeps parity if a provider ever reports it on a 200 response instead.
+                stop_reason = "model_context_window_exceeded"
+            else:
+                stop_reason = "max_tokens"
+
+        # stop_sequences: emulated by scanning output text (no native Responses param).
+        matched_stop: Optional[str] = None
+        normalized_stops = normalize_stop_sequences(stop_sequences)
+        if normalized_stops and stop_reason != "refusal":
+            matched_stop = apply_stop_sequences_to_content(content, normalized_stops)
+            if matched_stop is not None:
+                stop_reason = "stop_sequence"
 
         # usage
         raw_usage: Optional[ResponseAPIUsage] = response.usage
@@ -742,13 +849,16 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
         )
+        service_tier = map_service_tier(getattr(response, "service_tier", None))
+        if service_tier is not None:
+            anthropic_usage["service_tier"] = service_tier
 
         return AnthropicMessagesResponse(
             id=response.id,
             type="message",
             role="assistant",
             model=response.model or "unknown-model",
-            stop_sequence=None,
+            stop_sequence=matched_stop,
             usage=anthropic_usage,  # type: ignore
             content=content,  # type: ignore
             stop_reason=stop_reason,

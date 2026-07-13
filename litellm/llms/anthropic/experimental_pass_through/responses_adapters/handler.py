@@ -55,6 +55,10 @@ def _build_responses_kwargs(
 ) -> Dict[str, Any]:
     """
     Build the kwargs dict to pass directly to litellm.responses() / litellm.aresponses().
+
+    ``stop_sequences`` and ``top_k`` are not part of the Responses API. ``stop_sequences``
+    is emulated in the response/stream layer (which is why it is passed through to the
+    adapter separately), and ``top_k`` has no Responses equivalent so it is dropped.
     """
     # Build a typed AnthropicMessagesRequest for the adapter
     request_data: Dict[str, Any] = {
@@ -183,13 +187,14 @@ class LiteLLMMessagesToResponsesAPIHandler:
                 model=model,
                 claude_code_per_turn_usage=_CLAUDE_CODE_PER_TURN_USAGE,
                 tool_name_mapping=tool_name_mapping,
+                stop_sequences=stop_sequences,
             )
             return wrapper.async_anthropic_sse_wrapper()
 
         if not isinstance(result, ResponsesAPIResponse):
             raise ValueError(f"Expected ResponsesAPIResponse, got {type(result)}")
 
-        return _ADAPTER.translate_response(result, tool_name_mapping=tool_name_mapping)
+        return _ADAPTER.translate_response(result, tool_name_mapping=tool_name_mapping, stop_sequences=stop_sequences)
 
     @staticmethod
     def anthropic_messages_handler(
@@ -267,10 +272,11 @@ class LiteLLMMessagesToResponsesAPIHandler:
                 model=model,
                 claude_code_per_turn_usage=_CLAUDE_CODE_PER_TURN_USAGE,
                 tool_name_mapping=tool_name_mapping,
+                stop_sequences=stop_sequences,
             )
             return wrapper.async_anthropic_sse_wrapper()
 
         if not isinstance(result, ResponsesAPIResponse):
             raise ValueError(f"Expected ResponsesAPIResponse, got {type(result)}")
 
-        return _ADAPTER.translate_response(result, tool_name_mapping=tool_name_mapping)
+        return _ADAPTER.translate_response(result, tool_name_mapping=tool_name_mapping, stop_sequences=stop_sequences)

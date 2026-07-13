@@ -445,3 +445,114 @@ class TestProcessEventTextDeltaWithoutOutputItemAdded:
             ("content_block_start", 0),
             ("content_block_delta", 0),
         ]
+
+
+def _completed_event(**response_kwargs):
+    response_kwargs.setdefault("status", "completed")
+    response_kwargs.setdefault(
+        "usage",
+        SimpleNamespace(input_tokens=1, output_tokens=1, input_tokens_details=None),
+    )
+    response_kwargs.setdefault("output", [])
+    return {"type": "response.completed", "response": SimpleNamespace(**response_kwargs)}
+
+
+def _run_with_stop(stop_sequences, deltas):
+    """Stream a single text block made of ``deltas`` under ``stop_sequences``."""
+    events = [
+        {"type": "response.created"},
+        {"type": "response.output_item.added", "item": {"type": "message", "id": "m1"}},
+        *[{"type": "response.output_text.delta", "item_id": "m1", "delta": d} for d in deltas],
+        {"type": "response.output_item.done", "item": {"type": "message", "id": "m1"}},
+        _completed_event(),
+    ]
+    wrapper = AnthropicResponsesStreamWrapper(responses_stream=None, model="m", stop_sequences=stop_sequences)
+    for event in events:
+        wrapper._process_event(event)
+    chunks = list(wrapper._chunk_queue)
+    text = "".join(c["delta"]["text"] for c in chunks if c["type"] == "content_block_delta")
+    message_delta = next(c for c in chunks if c["type"] == "message_delta")
+    return text, message_delta, chunks
+
+
+def test_stop_sequence_truncates_streamed_text():
+    text, message_delta, _ = _run_with_stop(["STOP"], ["hello ", "world STOP tail"])
+    assert text == "hello world "
+    assert "tail" not in text
+    assert message_delta["delta"]["stop_reason"] == "stop_sequence"
+    assert message_delta["delta"]["stop_sequence"] == "STOP"
+
+
+def test_stop_sequence_spanning_two_deltas():
+    text, message_delta, _ = _run_with_stop(["STOP"], ["abc ST", "OP xyz"])
+    assert text == "abc "
+    assert message_delta["delta"]["stop_reason"] == "stop_sequence"
+
+
+def test_stop_sequence_partial_suffix_flushed_when_no_match():
+    """A trailing partial match that never completes is flushed at block done."""
+    text, message_delta, _ = _run_with_stop(["STOP"], ["abcST"])
+    assert text == "abcST"
+    assert message_delta["delta"]["stop_reason"] == "end_turn"
+    assert message_delta["delta"]["stop_sequence"] is None
+
+
+def test_stop_sequence_closes_block_and_suppresses_later_items():
+    """After a stop, a later output item (e.g. tool call) is not emitted."""
+    events = [
+        {"type": "response.created"},
+        {"type": "response.output_item.added", "item": {"type": "message", "id": "m1"}},
+        {"type": "response.output_text.delta", "item_id": "m1", "delta": "done STOP"},
+        {"type": "response.output_item.done", "item": {"type": "message", "id": "m1"}},
+        {
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "id": "f1", "call_id": "c1", "name": "ping"},
+        },
+        {"type": "response.output_item.done", "item": {"type": "function_call", "id": "f1"}},
+        _completed_event(output=[SimpleNamespace(type="function_call")]),
+    ]
+    wrapper = AnthropicResponsesStreamWrapper(responses_stream=None, model="m", stop_sequences=["STOP"])
+    for event in events:
+        wrapper._process_event(event)
+    chunks = list(wrapper._chunk_queue)
+    types = [c["type"] for c in chunks]
+    # only one content block (the text) — the tool_use block is suppressed
+    assert types.count("content_block_start") == 1
+    assert chunks[1]["content_block"]["type"] == "text"
+    message_delta = next(c for c in chunks if c["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "stop_sequence"
+
+
+def test_no_stop_sequences_emits_text_verbatim():
+    """Without stop_sequences the emulation is a no-op even if the string appears."""
+    text, message_delta, _ = _run_with_stop(None, ["STOP stays here"])
+    assert text == "STOP stays here"
+    assert message_delta["delta"]["stop_reason"] == "end_turn"
+
+
+def test_service_tier_echoed_in_message_delta():
+    events = [
+        {"type": "response.created"},
+        _completed_event(service_tier="priority"),
+    ]
+    chunks = _process_all(events)
+    message_delta = next(c for c in chunks if c["type"] == "message_delta")
+    assert message_delta["usage"]["service_tier"] == "priority"
+
+
+def test_model_context_window_exceeded_streaming_stop_reason():
+    events = [
+        {"type": "response.created"},
+        {
+            "type": "response.incomplete",
+            "response": SimpleNamespace(
+                status="incomplete",
+                incomplete_details=SimpleNamespace(reason="model_context_window_exceeded"),
+                usage=SimpleNamespace(input_tokens=9, output_tokens=0, input_tokens_details=None),
+                output=[],
+            ),
+        },
+    ]
+    chunks = _process_all(events)
+    message_delta = next(c for c in chunks if c["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "model_context_window_exceeded"
