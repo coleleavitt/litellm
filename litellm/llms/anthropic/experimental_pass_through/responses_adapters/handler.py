@@ -28,7 +28,9 @@ _CLAUDE_CODE_PER_TURN_USAGE = os.getenv("LITELLM_CLAUDE_CODE_PER_TURN_USAGE", ""
 
 
 def _create_tool_name_mapping(tools: Optional[List[Dict]]) -> Dict[str, str]:
-    return create_tool_name_mapping(cast(List[Dict[str, Any]], tools or []))
+    return create_tool_name_mapping(
+        cast(List[Dict[str, Any]], tools or [])  # cast-ok: validated by the Anthropic request schema
+    )
 
 
 def _build_responses_kwargs(

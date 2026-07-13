@@ -221,6 +221,20 @@ class AnthropicResponsesStreamWrapper:
             )
             return
 
+        if event_type == "response.refusal.delta":
+            item_id = getattr(event, "item_id", None) or (event.get("item_id") if isinstance(event, dict) else None)
+            delta = getattr(event, "delta", "") or (event.get("delta", "") if isinstance(event, dict) else "")
+            block_idx = self._item_id_to_block_index.get(item_id, -1) if item_id else self._current_block_index
+            if block_idx >= 0:
+                self._chunk_queue.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {"type": "text_delta", "text": delta},
+                    }
+                )
+            return
+
         # ---- reasoning summary text delta ----
         if event_type == "response.reasoning_summary_text.delta":
             item_id = getattr(event, "item_id", None) or (event.get("item_id") if isinstance(event, dict) else None)
@@ -337,6 +351,10 @@ class AnthropicResponsesStreamWrapper:
                     if out_type == "function_call":
                         stop_reason = "tool_use"
                         break
+                    content = _get_field(out_item, "content")
+                    content = content if isinstance(content, (list, tuple)) else ()
+                    if any(_get_field(part, "type") == "refusal" for part in content):
+                        stop_reason = "refusal"
 
             usage_delta: Dict[str, Any] = {
                 "input_tokens": input_tokens,
@@ -392,11 +410,8 @@ class AnthropicResponsesStreamWrapper:
         if self._chunk_queue:
             return self._chunk_queue.popleft()
 
-        if self._held_content_block_stop is not None:
-            self._flush_held_content_block_stop()
-            return self._chunk_queue.popleft()
-
-        raise StopAsyncIteration
+        self._queue_error("Upstream response ended before a terminal event")
+        return self._chunk_queue.popleft()
 
     async def async_anthropic_sse_wrapper(self) -> AsyncIterator[bytes]:
         """Yield SSE-encoded bytes for each Anthropic event chunk."""

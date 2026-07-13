@@ -17,11 +17,11 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from litellm.litellm_core_utils.reasoning_effort_utils import (
     reasoning_effort_from_thinking_budget,
 )
-from litellm.llms.anthropic.experimental_pass_through.utils import (
-    is_reasoning_auto_summary_enabled,
-)
 from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
     truncate_tool_name,
+)
+from litellm.llms.anthropic.experimental_pass_through.utils import (
+    is_reasoning_auto_summary_enabled,
 )
 from litellm.types.llms.anthropic import (
     AllAnthropicToolsValues,
@@ -40,7 +40,6 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 )
 from litellm.types.llms.openai import ResponsesAPIResponse
 
-
 OPENAI_MIN_RESPONSE_OUTPUT_TOKENS = 16
 
 
@@ -53,7 +52,7 @@ def _token_count(value: object) -> int:
 def _is_billing_header_block(value: object) -> bool:
     if not isinstance(value, dict):
         return False
-    block = cast(Dict[str, object], value)
+    block = cast(Dict[str, object], value)  # cast-ok: guarded by the dict check above
     text = block.get("text")
     return block.get("type") == "text" and isinstance(text, str) and text.startswith("x-anthropic-billing-header:")
 
@@ -63,7 +62,7 @@ def _filter_billing_headers_from_system(system: object) -> Optional[Union[str, L
         return None if system.startswith("x-anthropic-billing-header:") else system
     if not isinstance(system, list):
         return None
-    blocks = cast(List[object], system)
+    blocks = cast(List[object], system)  # cast-ok: guarded by the list check above
     return [block for block in blocks if not _is_billing_header_block(block)]
 
 
@@ -93,6 +92,7 @@ class _ContextManagementEdit(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     type: str
+    keep: object = None
 
 
 class _ContextManagementInput(BaseModel):
@@ -174,7 +174,7 @@ def _context_management_clears_thinking(context_management: object) -> bool:
         parsed = _ContextManagementInput.model_validate(context_management)
     except ValidationError:
         return False
-    return any(edit.type == "clear_thinking_20251015" for edit in parsed.edits)
+    return any(edit.type == "clear_thinking_20251015" and edit.keep == "none" for edit in parsed.edits)
 
 
 class LiteLLMAnthropicToResponsesAPIAdapter:
@@ -246,9 +246,13 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         if btype == "text":
                             user_parts.append({"type": "input_text", "text": block.get("text", "")})
                         elif btype == "image":
-                            url = self._translate_anthropic_image_source_to_url(
-                                cast(Dict[str, object], block.get("source", {}))
+                            source = block.get("source")
+                            source_dict = (
+                                cast(Dict[str, object], source)  # cast-ok: guarded by the dict check
+                                if isinstance(source, dict)
+                                else {}
                             )
+                            url = self._translate_anthropic_image_source_to_url(source_dict)
                             if url:
                                 user_parts.append({"type": "input_image", "image_url": url})
                         elif btype == "tool_result":
@@ -272,16 +276,20 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 for part in inner:
                                     if not isinstance(part, dict):
                                         continue
-                                    part_dict = cast(Dict[str, object], part)
+                                    part_dict = cast(Dict[str, object], part)  # cast-ok: guarded by the dict check
                                     if part_dict.get("type") == "text":
                                         text = part_dict.get("text")
                                         output_parts.append(
                                             {"type": "input_text", "text": text if isinstance(text, str) else ""}
                                         )
                                     elif part_dict.get("type") == "image":
-                                        url = self._translate_anthropic_image_source_to_url(
-                                            cast(Dict[str, object], part_dict.get("source", {}))
+                                        source = part_dict.get("source")
+                                        source_dict = (
+                                            cast(Dict[str, object], source)  # cast-ok: guarded by the dict check
+                                            if isinstance(source, dict)
+                                            else {}
                                         )
+                                        url = self._translate_anthropic_image_source_to_url(source_dict)
                                         if url:
                                             output_parts.append({"type": "input_image", "image_url": url})
                                 output = output_parts if output_parts else ""
@@ -346,6 +354,15 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                             thinking_text = block.get("thinking", "")
                             reasoning_state = decode_reasoning_signature(block.get("signature"))
                             if reasoning_state is not None:
+                                if asst_parts:
+                                    input_items.append(
+                                        {
+                                            "type": "message",
+                                            "role": "assistant",
+                                            "content": asst_parts,
+                                        }
+                                    )
+                                    asst_parts = []
                                 input_items.append(
                                     {
                                         "type": "reasoning",
@@ -378,7 +395,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         """Convert Anthropic tool definitions to Responses API function tools."""
         result: List[Dict[str, Any]] = []
         for tool in tools:
-            tool_dict = cast(Dict[str, Any], tool)
+            tool_dict = cast(Dict[str, Any], tool)  # cast-ok: validated by the Anthropic tool schema
             tool_type = tool_dict.get("type", "")
             tool_name_value = tool_dict.get("name", "")
             tool_name = tool_name_value if isinstance(tool_name_value, str) else ""
@@ -487,7 +504,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         litellm.responses() / litellm.aresponses() kwargs.
         """
         model: str = anthropic_request["model"]
-        messages_list = cast(
+        messages_list = cast(  # cast-ok: validated by AnthropicMessagesRequest
             List[
                 Union[
                     AnthropicMessagesUserMessageParam,
@@ -532,14 +549,14 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         tools = anthropic_request.get("tools")
         if tools:
             responses_kwargs["tools"] = self.translate_tools_to_responses_api(
-                cast(List[AllAnthropicToolsValues], tools)
+                cast(List[AllAnthropicToolsValues], tools)  # cast-ok: validated by AnthropicMessagesRequest
             )
 
         # tool_choice
         tool_choice = anthropic_request.get("tool_choice")
         if tool_choice:
             responses_kwargs["tool_choice"] = self.translate_tool_choice_to_responses_api(
-                cast(AnthropicMessagesToolChoice, tool_choice)
+                cast(AnthropicMessagesToolChoice, tool_choice)  # cast-ok: validated by AnthropicMessagesRequest
             )
             if "disable_parallel_tool_use" in tool_choice:
                 responses_kwargs["parallel_tool_calls"] = not bool(tool_choice["disable_parallel_tool_use"])
@@ -550,7 +567,9 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             output_config = anthropic_request.get("output_config")
             reasoning = self.translate_thinking_to_reasoning(
                 thinking,
-                output_config=cast(Optional[Dict[str, Any]], output_config),
+                output_config=cast(  # cast-ok: validated by AnthropicMessagesRequest
+                    Optional[Dict[str, Any]], output_config
+                ),
             )
             if reasoning:
                 responses_kwargs["reasoning"] = reasoning
@@ -631,6 +650,14 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         content.append(
                             AnthropicResponseContentBlockText(type="text", text=getattr(part, "text", "")).model_dump()
                         )
+                    elif getattr(part, "type", None) == "refusal":
+                        content.append(
+                            AnthropicResponseContentBlockText(
+                                type="text",
+                                text=getattr(part, "refusal", ""),
+                            ).model_dump()
+                        )
+                        stop_reason = "refusal"
 
             elif isinstance(item, ResponseFunctionToolCall):
                 try:
@@ -655,6 +682,14 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                             content.append(
                                 AnthropicResponseContentBlockText(type="text", text=part.get("text", "")).model_dump()
                             )
+                        elif isinstance(part, dict) and part.get("type") == "refusal":
+                            content.append(
+                                AnthropicResponseContentBlockText(
+                                    type="text",
+                                    text=part.get("refusal", ""),
+                                ).model_dump()
+                            )
+                            stop_reason = "refusal"
                 elif item_type == "function_call":
                     try:
                         input_data = json.loads(item.get("arguments", "{}"))
@@ -682,7 +717,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         output_tokens = int(getattr(raw_usage, "output_tokens", 0) or 0)
         input_token_details = getattr(raw_usage, "input_tokens_details", None)
         if isinstance(input_token_details, dict):
-            details = cast(Dict[str, object], input_token_details)
+            details = cast(Dict[str, object], input_token_details)  # cast-ok: guarded by the dict check
             cache_read_input_tokens = _token_count(details.get("cached_tokens"))
             cache_creation_input_tokens = _token_count(
                 details.get("cache_write_tokens", 0) or details.get("cache_creation_tokens", 0)

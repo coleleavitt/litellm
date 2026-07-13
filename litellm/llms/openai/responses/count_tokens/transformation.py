@@ -16,7 +16,6 @@ from litellm.types.llms.anthropic import (
     AnthropicMessagesUserMessageParam,
 )
 
-
 _ANTHROPIC_ADAPTER = LiteLLMAnthropicToResponsesAPIAdapter()
 
 
@@ -160,13 +159,18 @@ class OpenAICountTokensConfig:
 
     @staticmethod
     def _anthropic_system_to_instructions(system: Optional[object]) -> Optional[str]:
-        if system is None or isinstance(system, str):
-            return system
+        if system is None:
+            return None
+        if isinstance(system, str):
+            return None if system.startswith("x-anthropic-billing-header:") else system
         if isinstance(system, list):
             instructions = "\n".join(
                 str(block.get("text", ""))
                 for block in system
-                if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and block.get("text")
+                and not str(block.get("text", "")).startswith("x-anthropic-billing-header:")
             )
             return instructions or None
         return str(system)
@@ -180,15 +184,17 @@ class OpenAICountTokensConfig:
     ) -> bool:
         if isinstance(system, list) or any(cls._is_anthropic_tool(tool) for tool in tools or []):
             return True
-        return any(
-            isinstance(block, dict)
-            and (
-                block.get("type") in ("tool_use", "tool_result", "thinking", "redacted_thinking", "document")
-                or (block.get("type") == "image" and "source" in block)
-            )
-            for message in messages
-            for block in (message.get("content") if isinstance(message.get("content"), list) else [])
-        )
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and (
+                    block.get("type") in ("tool_use", "tool_result", "thinking", "redacted_thinking", "document")
+                    or (block.get("type") == "image" and "source" in block)
+                ):
+                    return True
+        return False
 
     @classmethod
     def messages_to_responses_input(

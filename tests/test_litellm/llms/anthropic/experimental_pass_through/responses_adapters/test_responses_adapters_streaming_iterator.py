@@ -208,6 +208,29 @@ def test_response_failed_emits_error_without_success_terminal_events():
     assert wrapper._held_content_block_stop is None
 
 
+async def test_upstream_eof_does_not_release_a_held_tool_call():
+    async def events():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "id": "item_1", "call_id": "call_1", "name": "ping"},
+        }
+        yield {"type": "response.output_item.done", "item": {"type": "function_call", "id": "item_1"}}
+
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=events(),
+        model="m",
+        claude_code_per_turn_usage=True,
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    assert [chunk["type"] for chunk in chunks] == [
+        "message_start",
+        "content_block_start",
+        "error",
+    ]
+    assert chunks[-1]["error"]["message"] == "Upstream response ended before a terminal event"
+
+
 def test_top_level_error_emits_anthropic_error():
     events = (
         {"type": "error", "code": "server_error", "message": "stream failed"},
@@ -246,6 +269,32 @@ def test_incomplete_reason_maps_to_anthropic_stop_reason():
 
         assert chunks[0]["delta"]["stop_reason"] == stop_reason
         assert chunks[1] == {"type": "message_stop"}
+
+
+def test_refusal_streams_as_text_with_refusal_stop_reason():
+    chunks = _process_all(
+        [
+            {"type": "response.output_item.added", "item": {"type": "message", "id": "message_1"}},
+            {"type": "response.refusal.delta", "item_id": "message_1", "delta": "I cannot help with that."},
+            {"type": "response.output_item.done", "item": {"type": "message", "id": "message_1"}},
+            {
+                "type": "response.completed",
+                "response": SimpleNamespace(
+                    status="completed",
+                    output=[
+                        SimpleNamespace(
+                            type="message",
+                            content=[SimpleNamespace(type="refusal", refusal="I cannot help with that.")],
+                        )
+                    ],
+                    usage=None,
+                ),
+            },
+        ]
+    )
+
+    assert chunks[1]["delta"] == {"type": "text_delta", "text": "I cannot help with that."}
+    assert chunks[-2]["delta"]["stop_reason"] == "refusal"
 
 
 def test_dict_terminal_usage_supports_cache_creation_aliases():

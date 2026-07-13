@@ -23,6 +23,7 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.transformation im
 )
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
     LiteLLMAnthropicToResponsesAPIAdapter,
+    encode_reasoning_signature,
 )
 from litellm.types.llms.anthropic import AnthropicMessagesRequest
 
@@ -139,6 +140,23 @@ class TestContextManagementConversion:
         kwargs = _ADAPTER.translate_request(req)
 
         assert kwargs["input"] == []
+
+    def test_clear_thinking_keep_all_preserves_replayed_reasoning(self):
+        reasoning = _make_reasoning_item(
+            ["Reasoning to retain."],
+            item_id="rs_keep",
+            encrypted_content="encrypted-keep-state",
+        )
+        signed_block = _ADAPTER.translate_response(_make_mock_response(output=[reasoning]))["content"][0]
+        req = _make_request(
+            messages=[{"role": "assistant", "content": [signed_block]}],
+            context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        )
+
+        kwargs = _ADAPTER.translate_request(req)
+
+        assert kwargs["input"][0]["type"] == "reasoning"
+        assert kwargs["input"][0]["encrypted_content"] == "encrypted-keep-state"
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +581,25 @@ class TestTranslateMessagesToResponsesInput:
         ]
         result = _translate_messages(messages)
         assert result == []
+
+    def test_encoded_reasoning_preserves_surrounding_text_order(self):
+        signature = encode_reasoning_signature("rs_1", "encrypted-state")
+        result = _translate_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Before"},
+                        {"type": "thinking", "thinking": "Reason", "signature": signature},
+                        {"type": "text", "text": "After"},
+                    ],
+                }
+            ]
+        )
+
+        assert [item["type"] for item in result] == ["message", "reasoning", "message"]
+        assert result[0]["content"][0]["text"] == "Before"
+        assert result[2]["content"][0]["text"] == "After"
 
     def test_mixed_messages_ordering(self):
         """Full multi-turn conversation is converted in order."""
@@ -1189,6 +1226,21 @@ class TestTranslateResponse:
         response = _make_mock_response(output=[_make_output_message(["Hi"])])
         result: Any = _ADAPTER.translate_response(response)
         assert result["stop_reason"] == "end_turn"
+
+    def test_refusal_is_preserved_as_text_and_stop_reason(self):
+        response = _make_mock_response(
+            output=[
+                {
+                    "type": "message",
+                    "content": [{"type": "refusal", "refusal": "I cannot help with that."}],
+                }
+            ]
+        )
+
+        result: Any = _ADAPTER.translate_response(response)
+
+        assert result["content"] == [{"type": "text", "text": "I cannot help with that."}]
+        assert result["stop_reason"] == "refusal"
 
     def test_incomplete_status_sets_max_tokens(self):
         """status='incomplete' overrides stop_reason to 'max_tokens'."""

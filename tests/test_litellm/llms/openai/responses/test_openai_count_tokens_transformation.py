@@ -286,11 +286,11 @@ def test_anthropic_history_maps_to_responses_count_request_without_reordering():
                 "role": "assistant",
                 "content": [{"type": "input_text", "text": "The call was queued."}],
             },
-                {
-                    "type": "function_call_output",
-                    "call_id": "toolu_123",
-                    "output": [{"type": "input_text", "text": "file contents"}],
-                },
+            {
+                "type": "function_call_output",
+                "call_id": "toolu_123",
+                "output": [{"type": "input_text", "text": "file contents"}],
+            },
             {
                 "type": "message",
                 "role": "user",
@@ -299,6 +299,18 @@ def test_anthropic_history_maps_to_responses_count_request_without_reordering():
         ],
     }
     TypeAdapter(InputTokenCountParams).validate_python(result)
+
+
+def test_anthropic_count_instructions_strip_billing_header():
+    _, instructions = OpenAICountTokensConfig.messages_to_responses_input(
+        [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
+        system=[
+            {"type": "text", "text": "x-anthropic-billing-header: synthetic"},
+            {"type": "text", "text": "Real instructions"},
+        ],
+    )
+
+    assert instructions == "Real instructions"
 
 
 def test_validate_request_valid():
