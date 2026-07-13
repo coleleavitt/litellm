@@ -4,6 +4,7 @@ Handler for the Anthropic v1/messages -> OpenAI Responses API path.
 Used when the target model is an OpenAI or Azure model.
 """
 
+import os
 from typing import Any, AsyncIterator, Coroutine, Dict, List, Optional, Union
 
 import litellm
@@ -17,6 +18,12 @@ from .streaming_iterator import AnthropicResponsesStreamWrapper
 from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 
 _ADAPTER = LiteLLMAnthropicToResponsesAPIAdapter()
+_CLAUDE_CODE_PER_TURN_USAGE = os.getenv("LITELLM_CLAUDE_CODE_PER_TURN_USAGE", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _build_responses_kwargs(
@@ -163,7 +170,11 @@ class LiteLLMMessagesToResponsesAPIHandler:
         result = await litellm.aresponses(**responses_kwargs)
 
         if stream:
-            wrapper = AnthropicResponsesStreamWrapper(responses_stream=result, model=model)
+            wrapper = AnthropicResponsesStreamWrapper(
+                responses_stream=result,
+                model=model,
+                claude_code_per_turn_usage=_CLAUDE_CODE_PER_TURN_USAGE,
+            )
             return wrapper.async_anthropic_sse_wrapper()
 
         if not isinstance(result, ResponsesAPIResponse):
@@ -241,7 +252,11 @@ class LiteLLMMessagesToResponsesAPIHandler:
         result = litellm.responses(**responses_kwargs)
 
         if stream:
-            wrapper = AnthropicResponsesStreamWrapper(responses_stream=result, model=model)
+            wrapper = AnthropicResponsesStreamWrapper(
+                responses_stream=result,
+                model=model,
+                claude_code_per_turn_usage=_CLAUDE_CODE_PER_TURN_USAGE,
+            )
             return wrapper.async_anthropic_sse_wrapper()
 
         if not isinstance(result, ResponsesAPIResponse):

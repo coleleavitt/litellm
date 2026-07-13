@@ -1,11 +1,9 @@
 # What is this?
 ## Translates OpenAI call to Anthropic `/v1/messages` format
 import json
-import traceback
 from collections import deque
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, Optional
 
-from litellm import verbose_logger
 from litellm._uuid import uuid
 
 
@@ -27,6 +25,7 @@ class AnthropicResponsesStreamWrapper:
         self,
         responses_stream: Any,
         model: str,
+        claude_code_per_turn_usage: bool = False,
     ) -> None:
         self.responses_stream = responses_stream
         self.model = model
@@ -38,9 +37,17 @@ class AnthropicResponsesStreamWrapper:
         self._pending_tool_ids: Dict[str, str] = {}  # item_id -> call_id / name accumulator
         self._sent_message_start = False
         self._sent_message_stop = False
-        self._chunk_queue: deque = deque()
+        self._claude_code_per_turn_usage = claude_code_per_turn_usage
+        self._held_content_block_stop: Optional[Dict[str, Any]] = None
+        self._chunk_queue: deque[Dict[str, Any]] = deque()
 
-    def _make_message_start(self) -> Dict[str, Any]:
+    def _make_message_start(self, usage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        initial_usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
         return {
             "type": "message_start",
             "message": {
@@ -51,18 +58,18 @@ class AnthropicResponsesStreamWrapper:
                 "model": self.model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                },
+                "usage": {**initial_usage, **(usage or {})},
             },
         }
 
     def _next_block_index(self) -> int:
         self._current_block_index += 1
         return self._current_block_index
+
+    def _flush_held_content_block_stop(self) -> None:
+        if self._held_content_block_stop is not None:
+            self._chunk_queue.append(self._held_content_block_stop)
+            self._held_content_block_stop = None
 
     def _process_event(self, event: Any) -> None:
         """Convert one Responses API event into zero or more Anthropic chunks queued for emission."""
@@ -75,12 +82,14 @@ class AnthropicResponsesStreamWrapper:
 
         # ---- message_start ----
         if event_type == "response.created":
-            self._sent_message_start = True
-            self._chunk_queue.append(self._make_message_start())
+            if not self._sent_message_start:
+                self._sent_message_start = True
+                self._chunk_queue.append(self._make_message_start())
             return
 
         # ---- content_block_start for a new output message item ----
         if event_type == "response.output_item.added":
+            self._flush_held_content_block_stop()
             item = getattr(event, "item", None) or (event.get("item") if isinstance(event, dict) else None)
             if item is None:
                 return
@@ -144,6 +153,7 @@ class AnthropicResponsesStreamWrapper:
                 block_idx = self._next_block_index()
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx
+                self._flush_held_content_block_stop()
                 self._chunk_queue.append(
                     {
                         "type": "content_block_start",
@@ -207,12 +217,12 @@ class AnthropicResponsesStreamWrapper:
                 if item_id
                 else self._current_block_index
             )
-            self._chunk_queue.append(
-                {
-                    "type": "content_block_stop",
-                    "index": block_idx,
-                }
-            )
+            stop_chunk = {"type": "content_block_stop", "index": block_idx}
+            if self._claude_code_per_turn_usage:
+                self._flush_held_content_block_stop()
+                self._held_content_block_stop = stop_chunk
+            else:
+                self._chunk_queue.append(stop_chunk)
             return
 
         # ---- response completed -> message_delta + message_stop ----
@@ -236,13 +246,18 @@ class AnthropicResponsesStreamWrapper:
                     stop_reason = "max_tokens"
                 usage = getattr(response_obj, "usage", None)
                 if usage is not None:
-                    input_tokens = getattr(usage, "input_tokens", 0) or 0
+                    total_input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
                     output_tokens = getattr(usage, "output_tokens", 0) or 0
-                    cache_creation_tokens = getattr(usage, "input_tokens_details", None)  # type: ignore[assignment]
-                    cache_read_tokens = getattr(usage, "output_tokens_details", None)  # type: ignore[assignment]
-                    # Prefer direct cache fields if present
-                    cache_creation_tokens = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-                    cache_read_tokens = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+                    input_details = getattr(usage, "input_tokens_details", None)
+                    cache_creation_tokens = int(
+                        getattr(usage, "cache_creation_input_tokens", 0)
+                        or getattr(input_details, "cache_write_tokens", 0)
+                        or 0
+                    )
+                    cache_read_tokens = int(
+                        getattr(usage, "cache_read_input_tokens", 0) or getattr(input_details, "cached_tokens", 0) or 0
+                    )
+                    input_tokens = max(0, total_input_tokens - cache_creation_tokens - cache_read_tokens)
 
             # Check if tool_use was in the output to override stop_reason
             if response_obj is not None:
@@ -263,6 +278,10 @@ class AnthropicResponsesStreamWrapper:
                 usage_delta["cache_creation_input_tokens"] = cache_creation_tokens
             if cache_read_tokens:
                 usage_delta["cache_read_input_tokens"] = cache_read_tokens
+
+            if self._claude_code_per_turn_usage and self._held_content_block_stop is not None:
+                self._chunk_queue.append(self._make_message_start(usage_delta))
+                self._flush_held_content_block_stop()
 
             self._chunk_queue.append(
                 {
@@ -297,11 +316,13 @@ class AnthropicResponsesStreamWrapper:
                     return self._chunk_queue.popleft()
         except StopAsyncIteration:
             pass
-        except Exception as e:
-            verbose_logger.error(f"AnthropicResponsesStreamWrapper error: {e}\n{traceback.format_exc()}")
 
         # Drain any remaining queued chunks
         if self._chunk_queue:
+            return self._chunk_queue.popleft()
+
+        if self._held_content_block_stop is not None:
+            self._flush_held_content_block_stop()
             return self._chunk_queue.popleft()
 
         raise StopAsyncIteration

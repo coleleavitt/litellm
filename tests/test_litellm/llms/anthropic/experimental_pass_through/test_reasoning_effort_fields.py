@@ -9,11 +9,12 @@ Covers:
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from unittest.mock import patch
 
 import pytest
 
+from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
 from litellm.llms.anthropic.experimental_pass_through.utils import (
     normalize_reasoning_effort_value,
 )
@@ -74,6 +75,7 @@ class TestModelRegistryReasoningEffortFields:
     @pytest.fixture(autouse=True)
     def _load_registry(self):
         self.registry = _load_model_registry()
+        self.local_registry = GetModelCostMap.load_local_model_cost_map()
 
     def test_opus_4_7_supports_max(self):
         entry = self.registry["claude-opus-4-7"]
@@ -118,6 +120,14 @@ class TestModelRegistryReasoningEffortFields:
         entry = self.registry["azure_ai/claude-opus-4-7"]
         assert entry.get("supports_max_reasoning_effort") is True
         assert "supports_minimal_reasoning_effort" not in entry
+
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+    )
+    def test_gpt_5_6_supports_max(self, model):
+        assert self.registry[model].get("supports_max_reasoning_effort") is True
+        assert self.local_registry[model].get("supports_max_reasoning_effort") is True
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +198,7 @@ class TestNormalizeReasoningEffortValue:
             "litellm.utils.get_model_info",
             return_value=_mock_model_info(supports_minimal_reasoning_effort=True),
         ):
-            assert (
-                normalize_reasoning_effort_value("minimal", model="test") == "minimal"
-            )
+            assert normalize_reasoning_effort_value("minimal", model="test") == "minimal"
 
     def test_minimal_degrades_to_low(self):
         with patch(
@@ -239,9 +247,7 @@ class TestAdapterAdaptiveThinking:
         )
 
         adapter = LiteLLMAnthropicMessagesAdapter()
-        result = adapter.translate_anthropic_thinking_to_reasoning_effort(
-            {"type": "adaptive"}
-        )
+        result = adapter.translate_anthropic_thinking_to_reasoning_effort({"type": "adaptive"})
         assert result == "medium"
 
     def test_messages_adapter_adaptive_overridden_by_output_config(self):

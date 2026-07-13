@@ -5,10 +5,9 @@ Tests for AnthropicResponsesStreamWrapper
 
 import os
 import sys
+from types import SimpleNamespace
 
-sys.path.insert(
-    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../.."))
-)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../..")))
 
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
     AnthropicResponsesStreamWrapper,
@@ -20,6 +19,114 @@ def _process_all(events: list) -> list:
     for event in events:
         wrapper._process_event(event)
     return list(wrapper._chunk_queue)
+
+
+def test_claude_code_per_turn_usage_precedes_tool_block_stop():
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=None,
+        model="m",
+        claude_code_per_turn_usage=True,
+    )
+    events = [
+        {"type": "response.created"},
+        {
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "id": "item_1", "call_id": "call_1", "name": "ping"},
+        },
+        {"type": "response.function_call_arguments.delta", "item_id": "item_1", "delta": '{"value":"ok"}'},
+        {"type": "response.output_item.done", "item": {"type": "function_call", "id": "item_1"}},
+        {
+            "type": "response.completed",
+            "response": SimpleNamespace(
+                status="completed",
+                usage=SimpleNamespace(
+                    input_tokens=57,
+                    output_tokens=21,
+                    input_tokens_details=SimpleNamespace(cached_tokens=40, cache_write_tokens=5),
+                ),
+                output=[SimpleNamespace(type="function_call")],
+            ),
+        },
+    ]
+
+    for event in events:
+        wrapper._process_event(event)
+
+    chunks = list(wrapper._chunk_queue)
+    assert [chunk["type"] for chunk in chunks] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "message_start",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert chunks[3]["message"]["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 21,
+        "cache_creation_input_tokens": 5,
+        "cache_read_input_tokens": 40,
+    }
+    assert chunks[5]["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 21,
+        "cache_creation_input_tokens": 5,
+        "cache_read_input_tokens": 40,
+    }
+    assert chunks[5]["delta"]["stop_reason"] == "tool_use"
+
+
+def test_claude_code_per_turn_usage_is_attached_only_to_final_block_stop():
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=None,
+        model="m",
+        claude_code_per_turn_usage=True,
+    )
+    events = [
+        {"type": "response.created"},
+        {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "reasoning_1"}},
+        {"type": "response.output_item.done", "item": {"type": "reasoning", "id": "reasoning_1"}},
+        {
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "id": "item_1", "call_id": "call_1", "name": "ping"},
+        },
+        {"type": "response.output_item.done", "item": {"type": "function_call", "id": "item_1"}},
+        {
+            "type": "response.completed",
+            "response": SimpleNamespace(
+                status="completed",
+                usage=SimpleNamespace(
+                    input_tokens=57,
+                    output_tokens=21,
+                    input_tokens_details=SimpleNamespace(cached_tokens=40, cache_write_tokens=5),
+                ),
+                output=[SimpleNamespace(type="function_call")],
+            ),
+        },
+    ]
+
+    for event in events:
+        wrapper._process_event(event)
+
+    chunks = list(wrapper._chunk_queue)
+    assert [chunk["type"] for chunk in chunks] == [
+        "message_start",
+        "content_block_start",
+        "content_block_stop",
+        "content_block_start",
+        "message_start",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert [chunk["type"] for chunk in chunks].count("message_start") == 2
+    assert chunks[4]["message"]["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 21,
+        "cache_creation_input_tokens": 5,
+        "cache_read_input_tokens": 40,
+    }
 
 
 class TestProcessEventTextDeltaWithoutOutputItemAdded:
