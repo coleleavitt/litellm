@@ -8,6 +8,8 @@ from pydantic import TypeAdapter
 
 from litellm._uuid import uuid
 
+from .transformation import encode_reasoning_item_signature
+
 _OBJECT_DICT_ADAPTER = TypeAdapter(Dict[str, object])
 
 
@@ -185,7 +187,7 @@ class AnthropicResponsesStreamWrapper:
                     {
                         "type": "content_block_start",
                         "index": block_idx,
-                        "content_block": {"type": "thinking", "thinking": ""},
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
                     }
                 )
             return
@@ -270,6 +272,18 @@ class AnthropicResponsesStreamWrapper:
                 block_idx = self._current_block_index
             else:
                 return
+            signature = encode_reasoning_item_signature(item)
+            if signature is not None:
+                self._chunk_queue.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": signature,
+                        },
+                    }
+                )
             stop_chunk = {"type": "content_block_stop", "index": block_idx}
             if self._claude_code_per_turn_usage:
                 self._flush_held_content_block_stop()

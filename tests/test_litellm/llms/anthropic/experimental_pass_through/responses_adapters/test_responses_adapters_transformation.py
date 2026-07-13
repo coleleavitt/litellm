@@ -112,6 +112,34 @@ class TestContextManagementConversion:
         kwargs = _ADAPTER.translate_request(req)
         assert "context_management" not in kwargs
 
+    def test_clear_thinking_drops_replayed_reasoning_and_fallback(self):
+        reasoning = _make_reasoning_item(
+            ["Reasoning to clear."],
+            item_id="rs_clear",
+            encrypted_content="encrypted-clear-state",
+        )
+        signed_block = _ADAPTER.translate_response(_make_mock_response(output=[reasoning]))["content"][0]
+        req = _make_request(
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        signed_block,
+                        {
+                            "type": "thinking",
+                            "thinking": "Native reasoning to clear.",
+                            "signature": "native-signature",
+                        },
+                    ],
+                }
+            ],
+            context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "none"}]},
+        )
+
+        kwargs = _ADAPTER.translate_request(req)
+
+        assert kwargs["input"] == []
+
 
 # ---------------------------------------------------------------------------
 # structured output via output_config
@@ -501,6 +529,30 @@ class TestTranslateMessagesToResponsesInput:
         result = _translate_messages(messages)
         assert result[0]["content"] == [{"type": "output_text", "text": "Let me reason step by step."}]
 
+    def test_native_thinking_signature_keeps_output_text_fallback(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Native provider reasoning.",
+                        "signature": "native-anthropic-signature",
+                    }
+                ],
+            }
+        ]
+
+        result = _translate_messages(messages)
+
+        assert result == [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Native provider reasoning."}],
+            }
+        ]
+
     def test_assistant_empty_thinking_block_skipped(self):
         """Assistant thinking block with empty thinking text is skipped."""
         messages = [
@@ -567,6 +619,24 @@ class TestTranslateMessagesToResponsesInput:
             "type": "input_image",
             "image_url": "https://example.com/cat.jpg",
         }
+
+    def test_malformed_litellm_signature_keeps_output_text_fallback(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Untrusted reasoning state.",
+                        "signature": "litellm_openai_reasoning_v1_not-valid!",
+                    }
+                ],
+            }
+        ]
+
+        result = _translate_messages(messages)
+
+        assert result[0]["content"] == [{"type": "output_text", "text": "Untrusted reasoning state."}]
 
     def test_unknown_image_source_type_skipped(self):
         """Image block with unknown source type is silently skipped."""
@@ -981,6 +1051,11 @@ class TestTranslateRequestBroaderCoverage:
         ):
             assert key not in kwargs, f"unexpected key: {key}"
 
+    def test_requests_encrypted_reasoning_content(self):
+        kwargs = _ADAPTER.translate_request(_make_request())
+
+        assert kwargs["include"] == ["reasoning.encrypted_content"]
+
 
 # ---------------------------------------------------------------------------
 # translate_response
@@ -1038,7 +1113,11 @@ def _make_function_call_item(call_id: str, name: str, arguments: str) -> MagicMo
     return item
 
 
-def _make_reasoning_item(summaries: List[str]) -> MagicMock:
+def _make_reasoning_item(
+    summaries: List[str],
+    item_id: str = "",
+    encrypted_content: str | None = None,
+) -> MagicMock:
     """Build a mock ResponseReasoningItem."""
     from openai.types.responses import ResponseReasoningItem  # type: ignore[import]
 
@@ -1049,6 +1128,9 @@ def _make_reasoning_item(summaries: List[str]) -> MagicMock:
         summary_mocks.append(s)
 
     item = MagicMock(spec=ResponseReasoningItem)
+    item.type = "reasoning"
+    item.id = item_id
+    item.encrypted_content = encrypted_content
     item.summary = summary_mocks
     return item
 
@@ -1125,6 +1207,28 @@ class TestTranslateResponse:
         assert len(result["content"]) == 1
         assert result["content"][0]["type"] == "thinking"
         assert "Step 1" in result["content"][0]["thinking"]
+
+    def test_reasoning_item_signature_round_trips_encrypted_state(self):
+        reasoning = _make_reasoning_item(
+            ["Inspect the tool result."],
+            item_id="rs_123",
+            encrypted_content="encrypted-reasoning-state",
+        )
+        response = _make_mock_response(output=[reasoning])
+
+        result: Any = _ADAPTER.translate_response(response)
+        thinking_block = result["content"][0]
+        replayed = _translate_messages([{"role": "assistant", "content": [thinking_block]}])
+
+        assert isinstance(thinking_block["signature"], str)
+        assert replayed == [
+            {
+                "type": "reasoning",
+                "id": "rs_123",
+                "encrypted_content": "encrypted-reasoning-state",
+                "summary": [{"type": "summary_text", "text": "Inspect the tool result."}],
+            }
+        ]
 
     def test_empty_reasoning_summary_skipped(self):
         """Reasoning item with empty text summary is not added to content."""

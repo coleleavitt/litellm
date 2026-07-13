@@ -5,9 +5,14 @@ This module owns all format conversions for the direct v1/messages -> Responses 
 path used for OpenAI and Azure models.
 """
 
+import base64
+import binascii
 import hashlib
 import json
-from typing import Any, Dict, List, Optional, Union, cast
+import re
+from typing import Any, Dict, List, Literal, Optional, Union, cast
+
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from litellm.litellm_core_utils.reasoning_effort_utils import (
     reasoning_effort_from_thinking_budget,
@@ -62,6 +67,116 @@ def _filter_billing_headers_from_system(system: object) -> Optional[Union[str, L
     return [block for block in blocks if not _is_billing_header_block(block)]
 
 
+class _ReasoningSignaturePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    encrypted_content: str
+
+
+class _ReasoningSummaryData(BaseModel):
+    model_config = ConfigDict(extra="ignore", from_attributes=True)
+
+    text: str
+
+
+class _ReasoningOutputItem(BaseModel):
+    model_config = ConfigDict(extra="ignore", from_attributes=True)
+
+    type: Literal["reasoning"]
+    id: str
+    encrypted_content: Optional[str] = None
+    summary: tuple[_ReasoningSummaryData, ...] = ()
+
+
+class _ContextManagementEdit(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    type: str
+
+
+class _ContextManagementInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    edits: tuple[_ContextManagementEdit, ...] = ()
+
+
+_REASONING_SIGNATURE_PREFIX = "litellm_openai_reasoning_v1_"
+_MAX_REASONING_PAYLOAD_BYTES = 8 * 1024 * 1024
+_MAX_REASONING_ITEM_ID_BYTES = 1024
+_MAX_ENCRYPTED_CONTENT_BYTES = _MAX_REASONING_PAYLOAD_BYTES - 4096
+_MAX_REASONING_SIGNATURE_CHARS = len(_REASONING_SIGNATURE_PREFIX) + 4 * ((_MAX_REASONING_PAYLOAD_BYTES + 2) // 3)
+
+
+def encode_reasoning_signature(
+    item_id: object,
+    encrypted_content: object,
+) -> Optional[str]:
+    if not isinstance(item_id, str) or not item_id:
+        return None
+    if not isinstance(encrypted_content, str) or not encrypted_content:
+        return None
+    if len(item_id.encode()) > _MAX_REASONING_ITEM_ID_BYTES:
+        return None
+    if len(encrypted_content.encode()) > _MAX_ENCRYPTED_CONTENT_BYTES:
+        return None
+    payload = json.dumps(
+        {"encrypted_content": encrypted_content, "id": item_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    if len(payload) > _MAX_REASONING_PAYLOAD_BYTES:
+        return None
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"{_REASONING_SIGNATURE_PREFIX}{encoded}"
+
+
+def encode_reasoning_item_signature(item: object) -> Optional[str]:
+    reasoning_item = _parse_reasoning_output_item(item)
+    if reasoning_item is None:
+        return None
+    return encode_reasoning_signature(reasoning_item.id, reasoning_item.encrypted_content)
+
+
+def _parse_reasoning_output_item(item: object) -> Optional[_ReasoningOutputItem]:
+    try:
+        return _ReasoningOutputItem.model_validate(item)
+    except ValidationError:
+        return None
+
+
+def decode_reasoning_signature(signature: object) -> Optional[_ReasoningSignaturePayload]:
+    if not isinstance(signature, str) or not signature.startswith(_REASONING_SIGNATURE_PREFIX):
+        return None
+    if len(signature) > _MAX_REASONING_SIGNATURE_CHARS:
+        return None
+    encoded = signature[len(_REASONING_SIGNATURE_PREFIX) :]
+    if not encoded or re.fullmatch(r"[A-Za-z0-9_-]+", encoded) is None:
+        return None
+    try:
+        raw_payload = base64.b64decode(
+            encoded + "=" * (-len(encoded) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+        if len(raw_payload) > _MAX_REASONING_PAYLOAD_BYTES:
+            return None
+        payload = _ReasoningSignaturePayload.model_validate_json(raw_payload)
+    except (binascii.Error, ValidationError, ValueError):
+        return None
+    if encode_reasoning_signature(payload.id, payload.encrypted_content) != signature:
+        return None
+    return payload
+
+
+def _context_management_clears_thinking(context_management: object) -> bool:
+    try:
+        parsed = _ContextManagementInput.model_validate(context_management)
+    except ValidationError:
+        return False
+    return any(edit.type == "clear_thinking_20251015" for edit in parsed.edits)
+
+
 class LiteLLMAnthropicToResponsesAPIAdapter:
     """
     Converts Anthropic /v1/messages requests to OpenAI Responses API format and
@@ -94,6 +209,8 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                 AnthopicMessagesAssistantMessageParam,
             ]
         ],
+        *,
+        drop_thinking_blocks: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Convert Anthropic messages list to Responses API `input` items.
@@ -224,8 +341,24 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 }
                             )
                         elif btype == "thinking":
+                            if drop_thinking_blocks:
+                                continue
                             thinking_text = block.get("thinking", "")
-                            if thinking_text:
+                            reasoning_state = decode_reasoning_signature(block.get("signature"))
+                            if reasoning_state is not None:
+                                input_items.append(
+                                    {
+                                        "type": "reasoning",
+                                        "id": reasoning_state.id,
+                                        "encrypted_content": reasoning_state.encrypted_content,
+                                        "summary": (
+                                            [{"type": "summary_text", "text": thinking_text}]
+                                            if isinstance(thinking_text, str) and thinking_text
+                                            else []
+                                        ),
+                                    }
+                                )
+                            elif thinking_text:
                                 asst_parts.append({"type": "output_text", "text": thinking_text})
                     if asst_parts:
                         input_items.append(
@@ -363,10 +496,16 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             ],
             anthropic_request["messages"],
         )
+        context_management = anthropic_request.get("context_management")
+        clear_thinking = _context_management_clears_thinking(context_management)
 
         responses_kwargs: Dict[str, Any] = {
             "model": model,
-            "input": self.translate_messages_to_responses_input(messages_list),
+            "input": self.translate_messages_to_responses_input(
+                messages_list,
+                drop_thinking_blocks=clear_thinking,
+            ),
+            "include": ["reasoning.encrypted_content"],
         }
 
         # system -> instructions
@@ -436,7 +575,6 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                 }
 
         # context_management: Anthropic dict -> OpenAI array
-        context_management = anthropic_request.get("context_management")
         if isinstance(context_management, dict):
             openai_cm = self.translate_context_management_to_responses_api(context_management)
             if openai_cm is not None:
@@ -463,11 +601,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         """
         Translate an OpenAI ResponsesAPIResponse to AnthropicMessagesResponse.
         """
-        from openai.types.responses import (
-            ResponseFunctionToolCall,
-            ResponseOutputMessage,
-            ResponseReasoningItem,
-        )
+        from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage
 
         from litellm.types.llms.openai import ResponseAPIUsage
 
@@ -475,17 +609,21 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         stop_reason: AnthropicFinishReason = "end_turn"
 
         for item in response.output:
-            if isinstance(item, ResponseReasoningItem):
-                for summary in item.summary:
-                    text = getattr(summary, "text", "")
-                    if text:
-                        content.append(
-                            AnthropicResponseContentBlockThinking(
-                                type="thinking",
-                                thinking=text,
-                                signature=None,
-                            ).model_dump()
-                        )
+            reasoning_item = _parse_reasoning_output_item(item)
+            if reasoning_item is not None:
+                summary_text = "\n".join(summary.text for summary in reasoning_item.summary if summary.text)
+                signature = encode_reasoning_signature(
+                    reasoning_item.id,
+                    reasoning_item.encrypted_content,
+                )
+                if summary_text or signature:
+                    content.append(
+                        AnthropicResponseContentBlockThinking(
+                            type="thinking",
+                            thinking=summary_text,
+                            signature=signature,
+                        ).model_dump()
+                    )
 
             elif isinstance(item, ResponseOutputMessage):
                 for part in item.content:

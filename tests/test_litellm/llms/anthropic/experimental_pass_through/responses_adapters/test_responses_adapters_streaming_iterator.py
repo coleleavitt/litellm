@@ -12,6 +12,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
     AnthropicResponsesStreamWrapper,
 )
+from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+    LiteLLMAnthropicToResponsesAPIAdapter,
+)
 
 
 def _process_all(events: list) -> list:
@@ -273,6 +276,69 @@ def test_dict_terminal_usage_supports_cache_creation_aliases():
             "cache_creation_input_tokens": 5,
             "cache_read_input_tokens": 30,
         }
+
+
+def test_reasoning_signature_streams_before_stop_and_round_trips():
+    wrapper = AnthropicResponsesStreamWrapper(responses_stream=None, model="m")
+    events = [
+        {
+            "type": "response.output_item.added",
+            "item": {"type": "reasoning", "id": "rs_stream"},
+        },
+        {
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_stream",
+            "delta": "Check the repository state.",
+        },
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_stream",
+                "encrypted_content": "encrypted-stream-state",
+            },
+        },
+    ]
+
+    for event in events:
+        wrapper._process_event(event)
+
+    chunks = list(wrapper._chunk_queue)
+    assert [chunk["type"] for chunk in chunks] == [
+        "content_block_start",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    assert chunks[2]["delta"]["type"] == "signature_delta"
+    adapter = LiteLLMAnthropicToResponsesAPIAdapter()
+    replayed = adapter.translate_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Check the repository state.",
+                        "signature": chunks[2]["delta"]["signature"],
+                    }
+                ],
+            }
+        ]
+    )
+    assert replayed == [
+        {
+            "type": "reasoning",
+            "id": "rs_stream",
+            "encrypted_content": "encrypted-stream-state",
+            "summary": [
+                {
+                    "type": "summary_text",
+                    "text": "Check the repository state.",
+                }
+            ],
+        }
+    ]
 
 
 class TestProcessEventTextDeltaWithoutOutputItemAdded:
