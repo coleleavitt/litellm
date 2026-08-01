@@ -1,0 +1,733 @@
+# Instincts generated from https://github.com/coleleavitt/litellm
+# Generated: 2026-08-01T03:32:14.186Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: litellm-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Commit Length
+
+## Action
+
+Write moderate-length commit messages (~78 characters)
+
+## Evidence
+
+- Average commit message length: 78 chars
+- Based on 38 commits
+
+---
+id: litellm-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: litellm-import-alias
+trigger: "when importing modules"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Import Alias
+
+## Action
+
+Use path aliases (@/, ~/) instead of relative imports
+
+## Evidence
+
+- Import analysis shows alias pattern
+- Example: import { x } from '@/lib/x'
+
+---
+id: litellm-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: litellm-arch-type-based
+trigger: "when adding new code"
+confidence: 0.8
+domain: architecture
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Arch Type Based
+
+## Action
+
+Place code in the appropriate type folder (components/, services/, utils/, etc.)
+
+## Evidence
+
+- Type-based module organization detected
+- Folders: 
+
+---
+id: litellm-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: litellm-test-framework
+trigger: "when writing tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Test Framework
+
+## Action
+
+Use vitest as the test framework
+
+## Evidence
+
+- Test framework detected: vitest
+- File pattern: *.test.tsx
+
+---
+id: litellm-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.tsx
+
+## Evidence
+
+- File pattern: *.test.tsx
+- Consistent across test files
+
+---
+id: litellm-test-mocking
+trigger: "when mocking dependencies in tests"
+confidence: 0.75
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Test Mocking
+
+## Action
+
+Use vi.mock for mocking
+
+## Evidence
+
+- Mocking pattern detected: vi.mock
+- Consistent across test files
+
+---
+id: litellm-test-types
+trigger: "when planning tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Test Types
+
+## Action
+
+Write unit, integration, e2e tests to match project standards
+
+## Evidence
+
+- Test types detected: unit, integration, e2e
+- Coverage config: yes
+
+---
+id: litellm-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.8
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~6x per month
+- Files: ui/litellm-dashboard/src/app/(dashboard)/budgets/_components/*, ui/litellm-dashboard/src/app/(dashboard)/hooks/budgets/*, ui/litellm-dashboard/src/app/(dashboard)/hooks/common/*
+
+---
+id: litellm-workflow-refactoring
+trigger: "when refactoring code"
+confidence: 0.8
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Workflow Refactoring
+
+## Action
+
+Follow the refactoring workflow:
+1. Ensure tests pass before refactor
+2. Refactor code structure
+3. Verify tests still pass
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~6x per month
+- Files: src/**/*
+
+---
+id: litellm-workflow-add-or-update-api-endpoint-with-contract-and-tests
+trigger: "when doing add or update api endpoint with contract and tests"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Workflow Add Or Update Api Endpoint With Contract And Tests
+
+## Action
+
+Follow the add-or-update-api-endpoint-with-contract-and-tests workflow:
+1. Create or update endpoint implementation in litellm/proxy/management_endpoints/ or litellm/proxy/management_endpoints/management_v1/
+2. Register endpoint in __init__.py or relevant index file
+3. Update or add types in litellm/types/proxy/management_endpoints/
+4. Update or add tests in tests/test_litellm/proxy/management_endpoints/ or tests/e2e/management/
+5. Update UI types in ui/litellm-dashboard/src/lib/http/schema.d.ts
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: litellm/proxy/management_endpoints/management_v1/*.py, litellm/proxy/management_endpoints/management_v1/__init__.py, litellm/types/proxy/management_endpoints/management_v1.py
+
+---
+id: litellm-workflow-ui-table-or-list-feature-enhancement
+trigger: "when doing ui table or list feature enhancement"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Workflow Ui Table Or List Feature Enhancement
+
+## Action
+
+Follow the ui-table-or-list-feature-enhancement workflow:
+1. Update or add React components in ui/litellm-dashboard/src/app/(dashboard)/*/_components/
+2. Add or update hooks in ui/litellm-dashboard/src/app/(dashboard)/hooks/
+3. Update shared table components in ui/litellm-dashboard/src/components/shared/DataTable/
+4. Update or add tests for components and hooks
+5. Update types in ui/litellm-dashboard/src/lib/http/schema.d.ts
+6. Coordinate with backend API/list contract changes if needed
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: ui/litellm-dashboard/src/app/(dashboard)/*/_components/*.tsx, ui/litellm-dashboard/src/app/(dashboard)/hooks/**/*.ts, ui/litellm-dashboard/src/components/shared/DataTable/*
+
+---
+id: litellm-workflow-fix-or-refactor-type-discipline-and-linting
+trigger: "when doing fix or refactor type discipline and linting"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Workflow Fix Or Refactor Type Discipline And Linting
+
+## Action
+
+Follow the fix-or-refactor-type-discipline-and-linting workflow:
+1. Update scripts/check_type_discipline.py or similar scripts
+2. Update type-discipline-budget.json, ruff-strict-budget.json, or basedpyright-code-budget.json
+3. Update or add corresponding tests in tests/test_litellm/test_check_type_discipline.py
+4. Re-ratchet or update budgets after merges
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: scripts/check_type_discipline.py, type-discipline-budget.json, ruff-strict-budget.json
+
+---
+id: litellm-workflow-dependency-update-with-regression-tests
+trigger: "when doing dependency update with regression tests"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Workflow Dependency Update With Regression Tests
+
+## Action
+
+Follow the dependency-update-with-regression-tests workflow:
+1. Update dependency version in pyproject.toml or requirements file
+2. Update lockfile (uv.lock)
+3. Add or update tests in tests/local_testing/ or other relevant test directories
+4. Document regression or fix in commit message
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: pyproject.toml, uv.lock, tests/local_testing/*.py
+
+---
+id: litellm-workflow-merge-feature-branch-with-conflict-resolution
+trigger: "when doing merge feature branch with conflict resolution"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/litellm
+---
+
+# Litellm Workflow Merge Feature Branch With Conflict Resolution
+
+## Action
+
+Follow the merge-feature-branch-with-conflict-resolution workflow:
+1. Merge remote-tracking branch into target branch
+2. Resolve conflicts across backend, types, tests, and UI files
+3. Update tests and UI types as needed
+4. Commit with a merge message listing resolved conflicts
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: litellm/proxy/management_endpoints/management_v1/*.py, litellm/types/proxy/management_endpoints/management_v1.py, tests/test_litellm/proxy/management_endpoints/management_v1/*.py
+
+---
+id: litellm-coding-file-naming
+trigger: "When creating or renaming a Python file"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Coding File Naming
+
+## Action
+
+Use snake_case for file names
+
+## Evidence
+
+- Pattern in litellm/* files
+- Pattern in tests/* files
+
+---
+id: litellm-coding-function-naming
+trigger: "When defining a function in Python"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Coding Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions
+
+---
+id: litellm-coding-class-naming
+trigger: "When defining a class in Python"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Coding Class Naming
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: litellm-coding-constant-naming
+trigger: "When defining a constant in Python"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Coding Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constants
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: litellm-coding-import-alias
+trigger: "When importing modules in Python"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Coding Import Alias
+
+## Action
+
+Use alias style imports
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+
+---
+id: litellm-coding-export-named
+trigger: "When exporting from a module"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Coding Export Named
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: litellm-testing-file-pattern
+trigger: "When creating a test file for UI components"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Testing File Pattern
+
+## Action
+
+Name the file with the pattern *.test.tsx
+
+## Evidence
+
+- Pattern in testing.filePattern
+- Seen in ui/litellm-dashboard/src/app/(dashboard)/budgets/_components/BudgetTable.test.tsx
+
+---
+id: litellm-testing-framework-vitest
+trigger: "When writing tests for UI components"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Testing Framework Vitest
+
+## Action
+
+Use the vitest testing framework
+
+## Evidence
+
+- Pattern in testing.framework
+
+---
+id: litellm-testing-mocking-vi-mock
+trigger: "When mocking dependencies in UI tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Testing Mocking Vi Mock
+
+## Action
+
+Use vi.mock for mocking
+
+## Evidence
+
+- Pattern in testing.mockingStyle
+
+---
+id: litellm-testing-coverage-config
+trigger: "When configuring tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Testing Coverage Config
+
+## Action
+
+Enable coverage configuration
+
+## Evidence
+
+- Pattern in testing.coverageConfig
+
+---
+id: litellm-git-commit-prefix
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Git Commit Prefix
+
+## Action
+
+Start the commit message with a prefix: fix, feat, refactor, chore, or test
+
+## Evidence
+
+- Seen in commit: fix(tag-management): drop unsupported prisma select kwarg from key lookup
+- Seen in commit: feat(ui): add sorting, filtering and search to the budgets page
+
+---
+id: litellm-git-commit-format-length
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Git Commit Format Length
+
+## Action
+
+Write concise commit messages with an average length of about 78 characters
+
+## Evidence
+
+- Pattern in commits.averageLength
+
+---
+id: litellm-git-commit-scope
+trigger: "When writing a commit message for a specific area"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Git Commit Scope
+
+## Action
+
+Include the scope in parentheses after the prefix, e.g., feat(ui): ...
+
+## Evidence
+
+- Seen in commit: feat(ui): add sorting, filtering and search to the budgets page
+- Seen in commit: fix(type-discipline): exempt values frozen in place by tuple/frozenset/MappingProxyType from LIT002
+
+---
+id: litellm-workflow-add-update-api-endpoint
+trigger: "When adding or updating an API endpoint in the proxy for management entities"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Workflow Add Update Api Endpoint
+
+## Action
+
+Implement or update the endpoint, register it, update types/contracts, add/update tests, and update UI schema types
+
+## Evidence
+
+- Workflow: add-or-update-api-endpoint-with-contract-and-tests
+- Files: litellm/proxy/management_endpoints/management_v1/*.py, litellm/types/proxy/management_endpoints/management_v1.py, tests/test_litellm/proxy/management_endpoints/management_v1/*.py, ui/litellm-dashboard/src/lib/http/schema.d.ts
+
+---
+id: litellm-workflow-ui-table-enhancement
+trigger: "When enhancing a dashboard table or list with new UX features or aligning with backend contracts"
+confidence: 0.92
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Workflow Ui Table Enhancement
+
+## Action
+
+Update/add React components, hooks, shared table components, tests, and types; coordinate with backend if needed
+
+## Evidence
+
+- Workflow: ui-table-or-list-feature-enhancement
+- Files: ui/litellm-dashboard/src/app/(dashboard)/*/_components/*.tsx, ui/litellm-dashboard/src/app/(dashboard)/hooks/**/*.ts, ui/litellm-dashboard/src/components/shared/DataTable/*, ui/litellm-dashboard/src/lib/http/schema.d.ts
+
+---
+id: litellm-workflow-type-discipline-fix
+trigger: "When enforcing stricter typing, updating type/lint budgets, or fixing type-related issues"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Workflow Type Discipline Fix
+
+## Action
+
+Update type discipline scripts, budgets, and related tests; re-ratchet budgets after merges
+
+## Evidence
+
+- Workflow: fix-or-refactor-type-discipline-and-linting
+- Files: scripts/check_type_discipline.py, type-discipline-budget.json, ruff-strict-budget.json, basedpyright-code-budget.json, tests/test_litellm/test_check_type_discipline.py
+
+---
+id: litellm-workflow-dependency-update
+trigger: "When updating a dependency version to fix a bug or security issue"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Workflow Dependency Update
+
+## Action
+
+Update dependency version, lockfile, add/update regression tests, and document the change in the commit message
+
+## Evidence
+
+- Workflow: dependency-update-with-regression-tests
+- Files: pyproject.toml, uv.lock, tests/local_testing/*.py
+
+---
+id: litellm-workflow-merge-feature-branch
+trigger: "When merging a large feature or staging branch into the main development branch"
+confidence: 0.88
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/litellm
+---
+
+# Litellm Workflow Merge Feature Branch
+
+## Action
+
+Merge the branch, resolve conflicts across backend, types, tests, and UI files, update tests and UI types, and commit with a merge message listing resolved conflicts
+
+## Evidence
+
+- Workflow: merge-feature-branch-with-conflict-resolution
+- Files: litellm/proxy/management_endpoints/management_v1/*.py, litellm/types/proxy/management_endpoints/management_v1.py, tests/test_litellm/proxy/management_endpoints/management_v1/*.py, ui/litellm-dashboard/src/lib/http/schema.d.ts, ui/litellm-dashboard/src/app/(dashboard)/**/*, pyproject.toml, uv.lock
+
